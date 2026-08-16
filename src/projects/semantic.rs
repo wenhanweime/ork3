@@ -11,8 +11,11 @@
 //! - A batch is applied whole or not at all. A malformed or partial reply is discarded rather
 //!   than scattering sessions across half-built topics (SPEC §3.4).
 
+use std::fs;
 use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -28,6 +31,52 @@ const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const MAX_KNOWN_TOPICS: usize = 60;
 /// Prevent one malformed backend label from making every later prompt unbounded.
 const MAX_TOPIC_LABEL_CHARS: usize = 80;
+static SCRATCH_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// Per-invocation state root for backends that do not provide a no-persist flag.
+///
+/// OpenCode stores sessions below `XDG_DATA_HOME`; pointing only that root at scratch preserves
+/// the user's config and authentication while keeping classifier sessions out of scanned roots.
+#[derive(Debug)]
+struct BackendScratch {
+    path: PathBuf,
+}
+
+impl BackendScratch {
+    fn create() -> Result<Self, BatchError> {
+        let base = std::env::temp_dir();
+        for _ in 0..100 {
+            let sequence = SCRATCH_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            let path = base.join(format!("ork3-semantic-{}-{sequence}", std::process::id()));
+            match fs::create_dir(&path) {
+                Ok(()) => return Ok(Self { path }),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => {
+                    return Err(BatchError::Failed(format!(
+                        "could not create backend scratch directory: {error}"
+                    )))
+                }
+            }
+        }
+        Err(BatchError::Failed(
+            "could not allocate a unique backend scratch directory".to_string(),
+        ))
+    }
+}
+
+impl Drop for BackendScratch {
+    fn drop(&mut self) {
+        if let Err(error) = fs::remove_dir_all(&self.path) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(
+                    category = "semantic_scratch_cleanup",
+                    path = %self.path.display(),
+                    "Could not remove semantic backend scratch directory: {error}"
+                );
+            }
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BackendSpec {
@@ -131,6 +180,7 @@ pub(crate) fn backend_command(backend: &str, model: Option<&str>, prompt: &str) 
         }
         "codex" => vec![
             "exec".to_string(),
+            "--ephemeral".to_string(),
             "--skip-git-repo-check".to_string(),
             prompt.to_string(),
         ],
@@ -289,9 +339,28 @@ pub(crate) fn run_backend(
     prompt: &str,
     timeout: Duration,
 ) -> Result<String, BatchError> {
+    run_backend_program(Path::new(backend), backend, model, prompt, timeout)
+}
+
+fn run_backend_program(
+    program: &Path,
+    backend: &str,
+    model: Option<&str>,
+    prompt: &str,
+    timeout: Duration,
+) -> Result<String, BatchError> {
     let args = backend_command(backend, model, prompt);
-    let mut child = Command::new(backend)
-        .args(&args)
+    let scratch = if backend == "opencode" {
+        Some(BackendScratch::create()?)
+    } else {
+        None
+    };
+    let mut command = Command::new(program);
+    command.args(&args);
+    if let Some(scratch) = scratch.as_ref() {
+        command.env("XDG_DATA_HOME", &scratch.path);
+    }
+    let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -557,6 +626,7 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     fn session(key: &str, title: &str, cwd: Option<&str>, backend: &str) -> PendingSemanticSession {
         PendingSemanticSession {
@@ -586,6 +656,55 @@ mod tests {
         for flag in ["-p", "-nt", "-ns", "-np", "-nc", "--no-session"] {
             assert!(args.contains(&flag.to_string()), "missing {flag}");
         }
+    }
+
+    #[test]
+    fn codex_command_disables_session_persistence() {
+        let args = backend_command("codex", None, "hi");
+        assert!(args.contains(&"--ephemeral".to_string()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opencode_backend_uses_disposable_data_root_without_touching_scan_root() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = BackendScratch::create().expect("fixture root");
+        let scan_root = fixture.path.join("scan-root");
+        fs::create_dir(&scan_root).expect("scan root");
+        let before = fs::read_dir(&scan_root).expect("scan root entries").count();
+        let fake_backend = fixture.path.join("fake-opencode");
+        fs::write(
+            &fake_backend,
+            "#!/bin/sh\nset -eu\nmkdir -p \"$XDG_DATA_HOME/opencode\"\nprintf session > \"$XDG_DATA_HOME/opencode/session\"\nprintf '%s\\n' \"$XDG_DATA_HOME\"\n",
+        )
+        .expect("fake backend");
+        let mut permissions = fs::metadata(&fake_backend)
+            .expect("fake backend metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&fake_backend, permissions).expect("executable fake backend");
+
+        let output = run_backend_program(
+            &fake_backend,
+            "opencode",
+            None,
+            "classify",
+            Duration::from_secs(5),
+        )
+        .expect("isolated backend run");
+        let isolated_root = PathBuf::from(output.trim());
+
+        assert_ne!(isolated_root, scan_root);
+        assert!(
+            !isolated_root.exists(),
+            "scratch should be removed after the backend exits"
+        );
+        assert_eq!(
+            fs::read_dir(&scan_root).expect("scan root entries").count(),
+            before,
+            "classification must not add sessions to a scanned root"
+        );
     }
 
     #[test]
