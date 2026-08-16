@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex, RwLock};
 
 use super::catalog::{CatalogError, ScanCompletion};
@@ -108,6 +108,7 @@ pub(crate) struct ProjectService {
     scan_workers: Vec<std::thread::JoinHandle<()>>,
     scanner: Option<Arc<Mutex<super::adapters::AdapterScanner>>>,
     scans_in_progress: Arc<AtomicUsize>,
+    shutdown: Arc<AtomicBool>,
 }
 
 impl ProjectService {
@@ -132,6 +133,7 @@ impl ProjectService {
             scan_workers: Vec::new(),
             scanner: None,
             scans_in_progress: Arc::new(AtomicUsize::new(0)),
+            shutdown: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -151,6 +153,7 @@ impl ProjectService {
             scan_workers: Vec::new(),
             scanner: None,
             scans_in_progress: Arc::new(AtomicUsize::new(0)),
+            shutdown: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -167,11 +170,16 @@ impl ProjectService {
             .unwrap_or_else(|_| ProjectsSnapshot::degraded("catalog_snapshot"));
         let snapshot = Arc::new(RwLock::new(initial));
         let worker_snapshot = Arc::clone(&snapshot);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let worker_shutdown = Arc::clone(&shutdown);
         let (sender, receiver) = mpsc::channel();
         let worker = std::thread::Builder::new()
-            .name("herdr-project-catalog".to_string())
+            .name("ork3-project-catalog".to_string())
             .spawn(move || {
                 while let Ok(command) = receiver.recv() {
+                    if worker_shutdown.load(Ordering::Acquire) {
+                        break;
+                    }
                     if !process_command(&mut catalog, &worker_snapshot, &event_hub, command) {
                         break;
                     }
@@ -191,6 +199,7 @@ impl ProjectService {
                 super::adapters::AdapterScanner::default(),
             ))),
             scans_in_progress: Arc::new(AtomicUsize::new(0)),
+            shutdown,
         }
     }
 
@@ -204,11 +213,12 @@ impl ProjectService {
         };
         let roots = roots.to_vec();
         let scans_in_progress = Arc::clone(&self.scans_in_progress);
+        let shutdown = Arc::clone(&self.shutdown);
         scans_in_progress.fetch_add(1, Ordering::Release);
         match std::thread::Builder::new()
-            .name("herdr-project-scan".to_string())
+            .name("ork3-project-scan".to_string())
             .spawn(move || {
-                run_background_scan(sender, scanner, roots);
+                run_background_scan(sender, scanner, roots, &shutdown);
                 scans_in_progress.fetch_sub(1, Ordering::Release);
             }) {
             Ok(worker) => self.scan_workers.push(worker),
@@ -282,13 +292,18 @@ impl ProjectService {
             return;
         };
         let scans_in_progress = Arc::clone(&self.scans_in_progress);
+        let shutdown = Arc::clone(&self.shutdown);
         match std::thread::Builder::new()
             .name("ork3-project-semantic".to_string())
             .spawn(move || {
-                while scans_in_progress.load(Ordering::Acquire) > 0 {
+                while scans_in_progress.load(Ordering::Acquire) > 0
+                    && !shutdown.load(Ordering::Acquire)
+                {
                     std::thread::sleep(std::time::Duration::from_millis(100));
                 }
-                super::semantic::run_classification_worker(&sender, &config);
+                if !shutdown.load(Ordering::Acquire) {
+                    super::semantic::run_classification_worker(&sender, &config, &shutdown);
+                }
             }) {
             Ok(worker) => self.scan_workers.push(worker),
             Err(error) => tracing::warn!(
@@ -354,12 +369,15 @@ impl ProjectService {
 
 impl Drop for ProjectService {
     fn drop(&mut self) {
-        for worker in self.scan_workers.drain(..) {
-            let _ = worker.join();
-        }
+        self.shutdown.store(true, Ordering::Release);
         if let Some(sender) = self.sender.take() {
             let _ = sender.send(ProjectCommand::Shutdown);
         }
+        // Adapter scans and semantic backends may be blocked in filesystem or
+        // subprocess work. They observe `shutdown` between bounded operations;
+        // detaching their handles prevents process shutdown from waiting on
+        // unrelated background discovery work.
+        self.scan_workers.clear();
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
@@ -370,8 +388,12 @@ fn run_background_scan(
     sender: mpsc::Sender<ProjectCommand>,
     scanner: Arc<Mutex<super::adapters::AdapterScanner>>,
     roots: Vec<super::adapters::AdapterRoot>,
+    shutdown: &AtomicBool,
 ) {
     for root in roots {
+        if shutdown.load(Ordering::Acquire) {
+            return;
+        }
         let scan = match scanner.lock() {
             Ok(mut scanner) => scanner.scan_root(&root, false),
             Err(_) => {
@@ -383,6 +405,9 @@ fn run_background_scan(
                 continue;
             }
         };
+        if shutdown.load(Ordering::Acquire) {
+            return;
+        }
         let mut completion = scan.completion;
         if !scan.reused_cache {
             let mut candidates = scan.candidates.into_iter();

@@ -1143,7 +1143,7 @@ fn completion_command_prints_zsh_script_without_session_startup() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("#compdef herdr"), "stdout: {stdout}");
+    assert!(stdout.contains("#compdef ork3"), "stdout: {stdout}");
     assert!(
         stdout.contains("bash elvish fish powershell zsh"),
         "stdout: {stdout}"
@@ -1176,7 +1176,7 @@ fn root_help_hides_explicit_client_command() {
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        !stdout.contains("herdr client"),
+        !stdout.contains("ork3 client"),
         "root help should not advertise the internal client command: {stdout}"
     );
 }
@@ -1191,7 +1191,7 @@ fn root_help_advertises_api_schema_command_group() {
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
-        stdout.contains("herdr api <subcommand>"),
+        stdout.contains("ork3 api <subcommand>"),
         "root help should advertise the api command group: {stdout}"
     );
 }
@@ -2518,7 +2518,7 @@ fn config_check_rejects_json_output() {
     assert!(checked.stdout.is_empty());
     assert_eq!(
         String::from_utf8_lossy(&checked.stderr),
-        "usage: herdr config check\n"
+        "usage: ork3 config check\n"
     );
 
     cleanup_test_base(&base);

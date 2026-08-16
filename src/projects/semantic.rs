@@ -420,11 +420,18 @@ pub(crate) fn classify_batch(
 fn run_classification_pass(
     sender: &std::sync::mpsc::Sender<super::service::ProjectCommand>,
     config: &SemanticConfig,
+    shutdown: &std::sync::atomic::AtomicBool,
 ) -> usize {
+    if shutdown.load(std::sync::atomic::Ordering::Acquire) {
+        return 0;
+    }
     // The file scan runs on its own thread, so on a cold start the Catalog is still empty here.
     // Poll until sessions appear rather than exiting and leaving the first launch unclassified.
     let deadline = Instant::now() + config.startup_grace;
     let pending = loop {
+        if shutdown.load(std::sync::atomic::Ordering::Acquire) {
+            return 0;
+        }
         match super::service::request_pending_semantic(sender, config.max_sessions_per_run) {
             Ok(pending) if !pending.is_empty() => break pending,
             Ok(_) => {
@@ -464,6 +471,9 @@ fn run_classification_pass(
         }
     };
     for (round, batch) in pending.chunks(config.batch_size.max(1)).enumerate() {
+        if shutdown.load(std::sync::atomic::Ordering::Acquire) {
+            return classified;
+        }
         let Some(assignments) = classify_batch(batch, config, round, &known_topics) else {
             failed_batches += 1;
             continue;
@@ -518,10 +528,11 @@ fn run_classification_pass(
 pub(crate) fn run_classification_worker(
     sender: &std::sync::mpsc::Sender<super::service::ProjectCommand>,
     config: &SemanticConfig,
+    shutdown: &std::sync::atomic::AtomicBool,
 ) {
     let mut idle_rounds = 0usize;
-    loop {
-        let classified = run_classification_pass(sender, config);
+    while !shutdown.load(std::sync::atomic::Ordering::Acquire) {
+        let classified = run_classification_pass(sender, config, shutdown);
         if classified == 0 {
             // Either everything is classified, or no backend is answering. Either way, back off
             // rather than spinning; a later pass retries after the idle interval.

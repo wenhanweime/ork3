@@ -239,7 +239,7 @@ const CLIENT_ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 // Headless server
 // ---------------------------------------------------------------------------
 
-/// The headless server — runs the herdr event loop without a real terminal.
+/// The headless server — runs the ORK3 event loop without a real terminal.
 pub struct HeadlessServer {
     app: app::App,
     #[cfg(unix)]
@@ -4014,7 +4014,14 @@ impl HeadlessServer {
             .collect::<Vec<_>>();
         crate::server::clipboard_image::remove_files(staged_files);
 
-        // Remove socket files.
+        // Stop accepting API connections and remove the API socket before the
+        // potentially slower session save that runs after this loop exits.
+        // `ork3 server stop` treats socket unreachability as the shutdown
+        // acknowledgement, so keeping this handle alive during persistence can
+        // produce false timeout failures on slower machines.
+        drop(self.api_server.take());
+
+        // Remove the client socket file.
         self.cleanup_sockets()?;
 
         Ok(())
@@ -4189,7 +4196,7 @@ pub fn run_server() -> io::Result<()> {
     let _api_server = match api::start_server(api_tx.clone(), event_hub.clone()) {
         Ok(server) => server,
         Err(err) if err.kind() == io::ErrorKind::AddrInUse => {
-            eprintln!("error: herdr server is already running");
+            eprintln!("error: ork3 server is already running");
             eprintln!("api socket: {}", api::socket_path().display());
             std::process::exit(1);
         }
@@ -4232,7 +4239,7 @@ pub fn run_server() -> io::Result<()> {
         ) {
             Ok(server) => server,
             Err(err) if err.kind() == io::ErrorKind::AddrInUse => {
-                eprintln!("error: herdr server is already running");
+                eprintln!("error: ork3 server is already running");
                 eprintln!("client socket: {}", client_socket_path().display());
                 std::process::exit(1);
             }
@@ -4242,7 +4249,7 @@ pub fn run_server() -> io::Result<()> {
         info!(
             api_socket = %api::socket_path().display(),
             client_socket = %client_socket_path().display(),
-            "herdr server started"
+            "ork3 server started"
         );
         print_ready_message(&api::socket_path(), &client_socket_path());
 
