@@ -1175,6 +1175,7 @@ mod tests {
             workspace_id: Some(workspace_id.clone()),
             pane_id: Some(public_pane_id.clone()),
             runtime_generation: Some(9),
+            session_class: crate::projects::SessionClass::Interactive,
         };
         app.state.projects.snapshot = crate::projects::ProjectsSnapshot {
             projects_schema_version: crate::projects::domain::PROJECTS_SCHEMA_VERSION,
@@ -1185,6 +1186,7 @@ mod tests {
                 display_name: "project-live".into(),
                 canonical_path: "/tmp/project-live".into(),
                 sessions: vec![session],
+                automation: Vec::new(),
                 next_cursor: None,
             }],
             topics: Vec::new(),

@@ -6016,6 +6016,37 @@
           ],
           "type": "string"
         },
+        "AutomationTemplateSummary": {
+          "properties": {
+            "backend": {
+              "type": "string"
+            },
+            "count": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "last_activity_at": {
+              "format": "int64",
+              "type": "integer"
+            },
+            "representative_session_key": {
+              "description": "Latest session in the template, useful as a stable representative for inspection.",
+              "type": "string"
+            },
+            "title": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "representative_session_key",
+            "title",
+            "backend",
+            "count",
+            "last_activity_at"
+          ],
+          "type": "object"
+        },
         "ClientWindowTitleReason": {
           "enum": [
             "set",
@@ -6743,6 +6774,11 @@
                 "integer",
                 "null"
               ]
+            },
+            "session_class": {
+              "$ref": "#/schemas/success_response/$defs/SessionClass",
+              "default": "interactive",
+              "description": "Server-owned classification. Additive/defaulted so v1 clients remain compatible."
             },
             "stable_key": {
               "type": "string"
@@ -8354,6 +8390,14 @@
         },
         "ProjectSummary": {
           "properties": {
+            "automation": {
+              "default": [],
+              "description": "Repeated automation templates stay visible as one collapsed row under their cwd Project.",
+              "items": {
+                "$ref": "#/schemas/success_response/$defs/AutomationTemplateSummary"
+              },
+              "type": "array"
+            },
             "canonical_key": {
               "type": "string"
             },
@@ -9577,6 +9621,14 @@
             "live_handoff"
           ],
           "type": "object"
+        },
+        "SessionClass": {
+          "enum": [
+            "interactive",
+            "automation",
+            "ephemeral"
+          ],
+          "type": "string"
         },
         "SessionCursor": {
           "properties": {

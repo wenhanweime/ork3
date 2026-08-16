@@ -728,9 +728,10 @@ impl App {
         let mut project_service = if no_session {
             crate::projects::ProjectService::disabled()
         } else {
-            crate::projects::ProjectService::open(
+            crate::projects::ProjectService::open_with_threshold(
                 &crate::session::data_dir().join("projects/catalog.sqlite3"),
                 event_hub.clone(),
+                config.projects.automation_title_threshold,
             )
         };
         if !no_session {
@@ -1557,7 +1558,7 @@ impl App {
 
         if !invalid_section("projects") && config.projects != self.loaded_projects_config {
             diagnostics.push(
-                "projects adapter root changes require a Herdr restart; keeping current roots"
+                "projects catalog settings require an ORK3 restart; keeping current settings"
                     .to_string(),
             );
         }

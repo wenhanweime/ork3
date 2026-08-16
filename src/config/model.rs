@@ -302,10 +302,21 @@ pub struct Config {
     pub remote: RemoteConfig,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default)]
 pub struct ProjectsConfig {
     pub adapters: ProjectAdaptersConfig,
+    /// Repeated normalized titles at or above this count are treated as automation templates.
+    pub automation_title_threshold: usize,
+}
+
+impl Default for ProjectsConfig {
+    fn default() -> Self {
+        Self {
+            adapters: ProjectAdaptersConfig::default(),
+            automation_title_threshold: 20,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]

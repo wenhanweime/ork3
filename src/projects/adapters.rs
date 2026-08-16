@@ -8,7 +8,8 @@ use serde_json::Value;
 
 use super::catalog::ScanCompletion;
 use super::{
-    CandidateField, SessionAliasCandidate, SessionCandidate, SessionIdentity, SourcePriority,
+    CandidateField, SessionAliasCandidate, SessionCandidate, SessionClass, SessionIdentity,
+    SourcePriority,
 };
 
 const MAX_HISTORY_FILE_BYTES: u64 = 64 * 1024 * 1024;
@@ -62,6 +63,8 @@ pub(crate) struct AdapterScan {
     pub root_key: String,
     pub candidates: Vec<SessionCandidate>,
     pub seen_source_keys: HashSet<String>,
+    /// Known non-session records that should be removed from the derived Catalog.
+    pub excluded_source_keys: HashSet<String>,
     pub completion: ScanCompletion,
     pub reused_cache: bool,
 }
@@ -382,6 +385,7 @@ fn empty_scan_with_key(
         root_key,
         candidates: Vec::new(),
         seen_source_keys: HashSet::new(),
+        excluded_source_keys: HashSet::new(),
         completion,
         reused_cache: false,
     }
@@ -391,6 +395,7 @@ fn empty_scan_with_key(
 struct ScanPayload {
     candidates: Vec<SessionCandidate>,
     seen_source_keys: HashSet<String>,
+    excluded_source_keys: HashSet<String>,
     malformed: usize,
     attempts: usize,
 }
@@ -446,6 +451,7 @@ fn perform_scan(adapter: &'static str, root: &Path, root_key: &str) -> (AdapterS
                     root_key: root_key.to_string(),
                     candidates: payload.candidates,
                     seen_source_keys: payload.seen_source_keys,
+                    excluded_source_keys: payload.excluded_source_keys,
                     completion,
                     reused_cache: false,
                 },
@@ -463,6 +469,7 @@ fn perform_scan(adapter: &'static str, root: &Path, root_key: &str) -> (AdapterS
                     root_key: root_key.to_string(),
                     candidates: Vec::new(),
                     seen_source_keys: HashSet::new(),
+                    excluded_source_keys: HashSet::new(),
                     completion,
                     reused_cache: false,
                 },
@@ -505,6 +512,7 @@ fn scan_jsonl_tree(
     Ok(ScanPayload {
         candidates,
         seen_source_keys: seen,
+        excluded_source_keys: HashSet::new(),
         malformed,
         attempts,
     })
@@ -642,6 +650,7 @@ fn is_excluded_history_path(path: &Path) -> bool {
 fn parse_codex(path: &Path, _root: &Path) -> Result<Option<SessionCandidate>, ()> {
     let mut identity = None;
     let mut cwd = None;
+    let mut session_class = SessionClass::Interactive;
     let mut picker = TitlePicker::default();
     let mut weight = SessionWeight::default();
     visit_json_lines(path, |value| {
@@ -657,6 +666,11 @@ fn parse_codex(path: &Path, _root: &Path) -> Result<Option<SessionCandidate>, ()
                     .get("cwd")
                     .and_then(Value::as_str)
                     .map(PathBuf::from);
+                let originator = payload.get("originator").and_then(Value::as_str);
+                let source = payload.get("source").and_then(Value::as_str);
+                if originator == Some("codex_exec") || source == Some("exec") {
+                    session_class = SessionClass::Automation;
+                }
             }
             Some("event_msg")
                 if value.pointer("/payload/type").and_then(Value::as_str)
@@ -685,6 +699,7 @@ fn parse_codex(path: &Path, _root: &Path) -> Result<Option<SessionCandidate>, ()
     let title = picker.take();
     let mut candidate = candidate_from_identity(identity, cwd, title, path)?;
     candidate.weight = weight;
+    candidate.session_class = Some(session_class);
     Ok(Some(candidate))
 }
 
@@ -849,6 +864,7 @@ fn scan_grok(root: &Path) -> Result<ScanPayload, ScanFailure> {
     Ok(ScanPayload {
         candidates,
         seen_source_keys: seen,
+        excluded_source_keys: HashSet::new(),
         malformed,
         attempts,
     })
@@ -871,9 +887,33 @@ fn scan_opencode(root: &Path) -> Result<ScanPayload, ScanFailure> {
     .map_err(|_| ScanFailure::Failed)?;
     let mut statement = connection
         .prepare(
-            "SELECT id, directory, title, time_created, time_updated
-             FROM session WHERE parent_id IS NULL AND time_archived IS NULL
-             ORDER BY time_updated DESC, id ASC",
+            "SELECT s.id, s.directory, s.title, s.time_created, s.time_updated,
+                    EXISTS (
+                        SELECT 1
+                        FROM message m
+                        JOIN part p ON p.message_id = m.id
+                        WHERE m.session_id = s.id
+                          AND json_extract(m.data, '$.role') = 'user'
+                          AND json_extract(p.data, '$.type') = 'text'
+                          AND (
+                              instr(json_extract(p.data, '$.text'),
+                                    '把下面的编码会话按主题聚类') > 0
+                              OR instr(json_extract(p.data, '$.text'),
+                                       '你是个人工作地图整理员') > 0
+                              OR instr(json_extract(p.data, '$.text'),
+                                       '你是本机 Agent 会话项目整理员') > 0
+                              OR instr(json_extract(p.data, '$.text'),
+                                       '你是本机会话档案编辑') > 0
+                              OR instr(json_extract(p.data, '$.text'),
+                                       '你是工程 Project 命名编辑') > 0
+                              OR instr(json_extract(p.data, '$.text'),
+                                       '你是工程任务命名编辑') > 0
+                              OR instr(json_extract(p.data, '$.text'),
+                                       '4-12个字的清晰任务主题名') > 0
+                          )
+                    ) AS classifier_artifact
+             FROM session s WHERE s.parent_id IS NULL AND s.time_archived IS NULL
+             ORDER BY s.time_updated DESC, s.id ASC",
         )
         .map_err(|_| ScanFailure::UnsupportedFormat)?;
     let rows = statement
@@ -884,14 +924,16 @@ fn scan_opencode(root: &Path) -> Result<ScanPayload, ScanFailure> {
                 row.get::<_, Option<String>>(2)?,
                 row.get::<_, Option<i64>>(3)?,
                 row.get::<_, Option<i64>>(4)?,
+                row.get::<_, bool>(5)?,
             ))
         })
         .map_err(|_| ScanFailure::Failed)?;
     let mut candidates = Vec::new();
     let mut seen = HashSet::new();
+    let mut excluded = HashSet::new();
     let mut malformed = 0usize;
     for row in rows {
-        let (id, cwd, title, first_activity_at, last_activity_at) = match row {
+        let (id, cwd, title, first_activity_at, last_activity_at, classifier_artifact) = match row {
             Ok(row) => row,
             Err(_) => {
                 malformed = malformed.saturating_add(1);
@@ -899,6 +941,12 @@ fn scan_opencode(root: &Path) -> Result<ScanPayload, ScanFailure> {
             }
         };
         let source_key = format!("{database_source_key}#{id}");
+        if classifier_artifact {
+            // These are local classifier invocations, not user sessions. Report the source as an
+            // explicit exclusion so the derived Catalog removes any copy imported by older builds.
+            excluded.insert(source_key);
+            continue;
+        }
         seen.insert(source_key.clone());
         let identity = match SessionIdentity::id("opencode", &id) {
             Ok(identity) => identity,
@@ -930,11 +978,13 @@ fn scan_opencode(root: &Path) -> Result<ScanPayload, ScanFailure> {
             aliases: Vec::new(),
             runtime: None,
             weight: SessionWeight::default(),
+            session_class: Some(SessionClass::Interactive),
         });
     }
     Ok(ScanPayload {
         candidates,
         seen_source_keys: seen,
+        excluded_source_keys: excluded,
         malformed,
         attempts: 1,
     })
@@ -966,6 +1016,7 @@ fn candidate_from_identity(
         aliases: Vec::new(),
         runtime: None,
         weight: SessionWeight::default(),
+        session_class: Some(SessionClass::Interactive),
     })
 }
 
@@ -1475,6 +1526,17 @@ mod tests {
                     parent_id TEXT,
                     time_archived INTEGER,
                     future_field TEXT
+                );
+                CREATE TABLE IF NOT EXISTS message (
+                    id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    data TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS part (
+                    id TEXT PRIMARY KEY,
+                    message_id TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    data TEXT NOT NULL
                 );",
             )
             .expect("opencode fixture schema");
@@ -1750,6 +1812,85 @@ mod tests {
         assert_eq!(scan.candidates.len(), 1);
         assert_eq!(scan.candidates[0].identity.canonical_ref_value, "codex-1");
         assert_eq!(scan.candidates[0].fallback_title(), "Build Dense Tree");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn codex_exec_is_automation_but_missing_originator_stays_interactive() {
+        let root = temp_dir("codex-session-class");
+        std::fs::write(
+            root.join("rollout-exec.jsonl"),
+            concat!(
+                "{\"type\":\"session_meta\",\"payload\":{\"id\":\"exec-1\",\"cwd\":\"/tmp\",\"originator\":\"codex_exec\",\"source\":\"exec\"}}\n",
+                "{\"type\":\"response_item\",\"payload\":{\"role\":\"user\",\"content\":[{\"text\":\"automated task\"}]}}\n"
+            ),
+        )
+        .expect("exec fixture");
+        std::fs::write(
+            root.join("rollout-legacy.jsonl"),
+            concat!(
+                "{\"type\":\"session_meta\",\"payload\":{\"id\":\"legacy-1\",\"cwd\":\"/tmp\"}}\n",
+                "{\"type\":\"response_item\",\"payload\":{\"role\":\"user\",\"content\":[{\"text\":\"interactive task\"}]}}\n"
+            ),
+        )
+        .expect("legacy fixture");
+
+        let scan = scan_default_root("codex", &root);
+        let classes = scan
+            .candidates
+            .iter()
+            .map(|candidate| {
+                (
+                    candidate.identity.canonical_ref_value.as_str(),
+                    candidate.session_class,
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        assert_eq!(classes.get("exec-1"), Some(&Some(SessionClass::Automation)));
+        assert_eq!(
+            classes.get("legacy-1"),
+            Some(&Some(SessionClass::Interactive)),
+            "old Codex files without originator must not be misclassified"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn opencode_classifier_artifacts_are_not_reimported_from_history() {
+        let root = temp_dir("opencode-classifier-artifact");
+        write_fixture(
+            "opencode",
+            &root,
+            "classifier-1",
+            Some("New session - 2026-08-17T00:00:00Z"),
+            Some("/tmp/ork3"),
+        );
+        let connection = opencode_connection(&root);
+        connection
+            .execute(
+                "INSERT INTO message(id, session_id, data)
+                 VALUES ('message-1', 'classifier-1', ?1)",
+                [serde_json::json!({"role": "user"}).to_string()],
+            )
+            .expect("classifier message");
+        connection
+            .execute(
+                "INSERT INTO part(id, message_id, session_id, data)
+                 VALUES ('part-1', 'message-1', 'classifier-1', ?1)",
+                [serde_json::json!({
+                    "type": "text",
+                    "text": "把下面的编码会话按主题聚类。只输出 JSON。"
+                })
+                .to_string()],
+            )
+            .expect("classifier prompt");
+        drop(connection);
+
+        let scan = scan_default_root("opencode", &root);
+        assert_eq!(scan.completion, ScanCompletion::Complete);
+        assert!(scan.candidates.is_empty());
+        assert!(scan.seen_source_keys.is_empty());
+        assert_eq!(scan.excluded_source_keys.len(), 1);
         let _ = std::fs::remove_dir_all(root);
     }
 

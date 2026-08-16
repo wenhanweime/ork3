@@ -3942,6 +3942,7 @@ mod tests {
                 display_name: "ait".into(),
                 canonical_path: "/tmp/ait".into(),
                 sessions: Vec::new(),
+                automation: Vec::new(),
                 next_cursor: None,
             }],
             topics: Vec::new(),

@@ -35,6 +35,18 @@ pub(crate) fn semantic_topic_key(label: &str) -> String {
     )
 }
 
+/// Stable identity for repeated session templates.
+///
+/// Automation detection deliberately ignores casing and whitespace differences so a runner that
+/// wraps the same prompt differently across versions still forms one template group.
+pub(crate) fn normalize_session_title(title: &str) -> String {
+    title
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
 /// Case- and whitespace-insensitive topic identity.
 ///
 /// Classifiers return `"Herdr 重构"` and `"herdr  重构"` for the same cluster across batches;
@@ -320,6 +332,8 @@ pub(crate) struct SessionCandidate {
     pub runtime: Option<RuntimeMapping>,
     /// How much the user actually said. Thin sessions are skipped by the classifier.
     pub weight: super::adapters::SessionWeight,
+    /// `None` means this source has no authority to change an existing class (runtime reports).
+    pub session_class: Option<SessionClass>,
 }
 
 impl SessionCandidate {
@@ -331,6 +345,27 @@ impl SessionCandidate {
             },
             |field| field.value.clone(),
         )
+    }
+}
+
+#[derive(
+    Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionClass {
+    #[default]
+    Interactive,
+    Automation,
+    Ephemeral,
+}
+
+impl SessionClass {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Interactive => "interactive",
+            Self::Automation => "automation",
+            Self::Ephemeral => "ephemeral",
+        }
     }
 }
 
@@ -438,6 +473,19 @@ pub struct IndexedSessionSummary {
     pub workspace_id: Option<String>,
     pub pane_id: Option<String>,
     pub runtime_generation: Option<u64>,
+    /// Server-owned classification. Additive/defaulted so v1 clients remain compatible.
+    #[serde(default)]
+    pub session_class: SessionClass,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AutomationTemplateSummary {
+    /// Latest session in the template, useful as a stable representative for inspection.
+    pub representative_session_key: String,
+    pub title: String,
+    pub backend: String,
+    pub count: u64,
+    pub last_activity_at: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -447,6 +495,9 @@ pub struct ProjectSummary {
     pub display_name: String,
     pub canonical_path: String,
     pub sessions: Vec<IndexedSessionSummary>,
+    /// Repeated automation templates stay visible as one collapsed row under their cwd Project.
+    #[serde(default)]
+    pub automation: Vec<AutomationTemplateSummary>,
     pub next_cursor: Option<SessionCursor>,
 }
 
@@ -675,6 +726,7 @@ mod tests {
             aliases: Vec::new(),
             runtime: None,
             weight: Default::default(),
+            session_class: Some(SessionClass::Interactive),
         };
         assert_eq!(
             candidate.fallback_title(),

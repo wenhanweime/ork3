@@ -9,7 +9,7 @@ use ratatui::{
 use crate::app::state::{
     AppState, ProjectFilter, ProjectRowHitArea, ProjectSessionActivation, ProjectTreeAction,
 };
-use crate::projects::{IndexedSessionSummary, ProjectKind};
+use crate::projects::{AutomationTemplateSummary, IndexedSessionSummary, ProjectKind};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ProjectTreeRow {
@@ -21,6 +21,7 @@ pub(crate) enum ProjectTreeRow {
         kind: ProjectKind,
     },
     Session(IndexedSessionSummary),
+    Automation(AutomationTemplateSummary),
     LoadOlder {
         project_key: String,
     },
@@ -56,6 +57,7 @@ impl ProjectTreeRow {
                 };
                 Some(ProjectTreeAction::Activate(activation))
             }
+            Self::Automation(_) => None,
             Self::LoadOlder { project_key } => Some(ProjectTreeAction::LoadOlder {
                 project_key: project_key.clone(),
             }),
@@ -119,7 +121,19 @@ pub(crate) fn project_tree_rows(app: &AppState) -> Vec<ProjectTreeRow> {
             })
             .cloned()
             .collect::<Vec<_>>();
-        if sessions.is_empty() {
+        let automation = project
+            .automation
+            .iter()
+            .filter(|_| app.projects.filter == ProjectFilter::All)
+            .filter(|template| {
+                project_matches
+                    || format!("{} {}", template.title, template.backend)
+                        .to_lowercase()
+                        .contains(&query)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if sessions.is_empty() && automation.is_empty() {
             continue;
         }
 
@@ -128,12 +142,15 @@ pub(crate) fn project_tree_rows(app: &AppState) -> Vec<ProjectTreeRow> {
         rows.push(ProjectTreeRow::Project {
             project_key: project.canonical_key.clone(),
             display_name: project.display_name.clone(),
-            session_count: sessions.len(),
+            session_count: automation.iter().fold(sessions.len(), |count, template| {
+                count.saturating_add(usize::try_from(template.count).unwrap_or(usize::MAX))
+            }),
             collapsed,
             kind: project.kind,
         });
         if !collapsed {
             rows.extend(sessions.into_iter().map(ProjectTreeRow::Session));
+            rows.extend(automation.into_iter().map(ProjectTreeRow::Automation));
             if project.next_cursor.is_some() && app.projects.filter == ProjectFilter::All {
                 rows.push(ProjectTreeRow::LoadOlder {
                     project_key: project.canonical_key.clone(),
@@ -454,6 +471,17 @@ pub(crate) fn render_projects_sidebar(app: &AppState, frame: &mut Frame, area: R
                     Style::default().fg(app.palette.overlay0),
                 ),
             ]),
+            ProjectTreeRow::Automation(template) => Line::from(vec![
+                Span::styled("  ◇ ", Style::default().fg(app.palette.overlay0)),
+                Span::styled(
+                    format!("{} × {}", template.title, template.count),
+                    Style::default().fg(app.palette.subtext0),
+                ),
+                Span::styled(
+                    format!(" · {} automation", template.backend),
+                    Style::default().fg(app.palette.overlay0),
+                ),
+            ]),
             ProjectTreeRow::LoadOlder { .. } => Line::from(Span::styled(
                 "  Load older…",
                 Style::default().fg(app.palette.accent),
@@ -548,7 +576,9 @@ mod tests {
                     workspace_id: Some("workspace-1".into()),
                     pane_id: Some("workspace-1:p1".into()),
                     runtime_generation: Some(4),
+                    session_class: crate::projects::SessionClass::Interactive,
                 }],
+                automation: Vec::new(),
                 next_cursor: None,
             }],
             topics: Vec::new(),
@@ -721,5 +751,38 @@ mod tests {
             row,
             ProjectTreeRow::Project { display_name, .. } if display_name == "ait"
         )));
+    }
+
+    #[test]
+    fn automation_templates_render_as_one_non_activating_directory_row() {
+        let mut state = AppState::test_new();
+        let mut snapshot = snapshot();
+        snapshot.projects[0].automation = vec![AutomationTemplateSummary {
+            representative_session_key: "automation-1".into(),
+            title: "OpenClaw watchdog".into(),
+            backend: "codex".into(),
+            count: 8_955,
+            last_activity_at: 3,
+        }];
+        state.projects.snapshot = snapshot;
+
+        let rows = project_tree_rows(&state);
+        assert!(matches!(
+            rows.last(),
+            Some(ProjectTreeRow::Automation(template)) if template.count == 8_955
+        ));
+        assert!(rows.last().and_then(ProjectTreeRow::action).is_none());
+        assert!(matches!(
+            &rows[0],
+            ProjectTreeRow::Project {
+                session_count: 8_956,
+                ..
+            }
+        ));
+
+        state.sidebar_view = crate::app::state::SidebarView::Clusters;
+        assert!(!project_tree_rows(&state)
+            .iter()
+            .any(|row| matches!(row, ProjectTreeRow::Automation(_))));
     }
 }

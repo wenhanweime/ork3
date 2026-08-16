@@ -79,6 +79,7 @@ pub(crate) enum ProjectCommand {
         root_key: String,
         completion: ScanCompletion,
         seen_source_keys: HashSet<String>,
+        excluded_source_keys: HashSet<String>,
         observed_at: i64,
         reply: mpsc::Sender<Result<u64, ProjectServiceError>>,
     },
@@ -112,8 +113,17 @@ pub(crate) struct ProjectService {
 }
 
 impl ProjectService {
+    #[cfg(test)]
     pub(crate) fn open(path: &Path, event_hub: crate::api::EventHub) -> Self {
-        match ProjectCatalog::open(path) {
+        Self::open_with_threshold(path, event_hub, 20)
+    }
+
+    pub(crate) fn open_with_threshold(
+        path: &Path,
+        event_hub: crate::api::EventHub,
+        automation_title_threshold: usize,
+    ) -> Self {
+        match ProjectCatalog::open_with_threshold(path, automation_title_threshold) {
             Ok(catalog) => Self::from_catalog(catalog, event_hub),
             Err(error) => {
                 tracing::warn!(
@@ -441,6 +451,7 @@ fn run_background_scan(
             root_key: scan.root_key,
             completion,
             seen_source_keys: scan.seen_source_keys,
+            excluded_source_keys: scan.excluded_source_keys,
             observed_at,
             reply,
         }) {
@@ -598,6 +609,7 @@ fn process_command(
             root_key,
             completion,
             seen_source_keys,
+            excluded_source_keys,
             observed_at,
             reply,
         } => finish_mutation(catalog, snapshot, event_hub, reply, |catalog| {
@@ -606,6 +618,7 @@ fn process_command(
                 &root_key,
                 completion,
                 &seen_source_keys,
+                &excluded_source_keys,
                 observed_at,
             )
         }),
@@ -677,6 +690,7 @@ mod tests {
             aliases: Vec::new(),
             runtime: None,
             weight: Default::default(),
+            session_class: Some(crate::projects::SessionClass::Interactive),
         }
     }
 

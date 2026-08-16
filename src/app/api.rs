@@ -2256,6 +2256,7 @@ mod tests {
                 aliases: Vec::new(),
                 runtime: None,
                 weight: Default::default(),
+                session_class: Some(crate::projects::SessionClass::Interactive),
             })
             .expect("fixture upsert");
 

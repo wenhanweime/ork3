@@ -129,9 +129,10 @@ impl App {
         if self.project_service.is_available() {
             return;
         }
-        let mut service = crate::projects::ProjectService::open(
+        let mut service = crate::projects::ProjectService::open_with_threshold(
             &crate::session::data_dir().join("projects/catalog.sqlite3"),
             self.event_hub.clone(),
+            self.loaded_projects_config.automation_title_threshold,
         );
         service.start_background_scan(self.project_roots.roots());
         self.project_service = service;

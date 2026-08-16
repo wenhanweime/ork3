@@ -6,12 +6,13 @@ use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBe
 
 use super::classifier;
 use super::domain::{
-    AdapterScanStatus, CandidateField, IndexedSessionSummary, PendingSemanticSession,
-    ProjectClassification, ProjectKind, ProjectSummary, ProjectsSnapshot, SemanticAssignment,
-    SessionCandidate, SessionCursor, SessionIdentity, SessionRefKind, PROJECTS_SCHEMA_VERSION,
+    normalize_session_title, AdapterScanStatus, AutomationTemplateSummary, CandidateField,
+    IndexedSessionSummary, PendingSemanticSession, ProjectClassification, ProjectKind,
+    ProjectSummary, ProjectsSnapshot, SemanticAssignment, SessionCandidate, SessionClass,
+    SessionCursor, SessionIdentity, SessionRefKind, PROJECTS_SCHEMA_VERSION,
 };
 
-const CATALOG_SCHEMA_VERSION: u32 = 2;
+const CATALOG_SCHEMA_VERSION: u32 = 3;
 
 /// Keyset page over one project's sessions.
 ///
@@ -21,11 +22,12 @@ const CATALOG_SCHEMA_VERSION: u32 = 2;
 /// `sessions_page_query_uses_the_total_order_index` guards against.
 const SESSIONS_PAGE_SQL: &str = "SELECT s.stable_key, s.backend, s.ref_kind, s.title, s.cwd,
             s.first_activity_at, s.last_activity_at,
-            r.workspace_id, r.pane_id, r.generation
+            r.workspace_id, r.pane_id, r.generation, s.session_class
      FROM sessions s
      CROSS JOIN assignments a ON a.session_key = s.stable_key
      LEFT JOIN runtime_mappings r ON r.session_key = s.stable_key
      WHERE a.project_id = ?1
+       AND (s.session_class = 'interactive' OR a.locked = 1)
        AND (?2 IS NULL OR s.last_activity_at < ?2
             OR (s.last_activity_at = ?2 AND s.stable_key > ?3))
      ORDER BY s.last_activity_at DESC, s.stable_key ASC
@@ -37,11 +39,12 @@ const SESSIONS_PAGE_SQL: &str = "SELECT s.stable_key, s.backend, s.ref_kind, s.t
 /// in `assignments` and is never replaced by an inferred topic.
 const TOPIC_SESSIONS_PAGE_SQL: &str = "SELECT s.stable_key, s.backend, s.ref_kind, s.title, s.cwd,
             s.first_activity_at, s.last_activity_at,
-            r.workspace_id, r.pane_id, r.generation
+            r.workspace_id, r.pane_id, r.generation, s.session_class
      FROM sessions s
      CROSS JOIN semantic_assignments sa ON sa.session_key = s.stable_key
      LEFT JOIN runtime_mappings r ON r.session_key = s.stable_key
      WHERE sa.topic_key = ?1
+       AND s.session_class = 'interactive'
        AND (?2 IS NULL OR s.last_activity_at < ?2
             OR (s.last_activity_at = ?2 AND s.stable_key > ?3))
      ORDER BY s.last_activity_at DESC, s.stable_key ASC
@@ -137,23 +140,37 @@ impl ScanCompletion {
 
 pub(crate) struct ProjectCatalog {
     connection: Connection,
+    automation_title_threshold: usize,
 }
 
 impl ProjectCatalog {
+    #[cfg(test)]
     pub(crate) fn open(path: &Path) -> Result<Self, CatalogError> {
+        Self::open_with_threshold(path, 20)
+    }
+
+    pub(crate) fn open_with_threshold(
+        path: &Path,
+        automation_title_threshold: usize,
+    ) -> Result<Self, CatalogError> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let connection = Connection::open(path)?;
-        Self::initialize(connection, true)
+        Self::initialize(connection, true, Some(path), automation_title_threshold)
     }
 
     #[cfg(test)]
     pub(crate) fn open_in_memory() -> Result<Self, CatalogError> {
-        Self::initialize(Connection::open_in_memory()?, false)
+        Self::initialize(Connection::open_in_memory()?, false, None, 20)
     }
 
-    fn initialize(connection: Connection, use_wal: bool) -> Result<Self, CatalogError> {
+    fn initialize(
+        connection: Connection,
+        use_wal: bool,
+        path: Option<&Path>,
+        automation_title_threshold: usize,
+    ) -> Result<Self, CatalogError> {
         connection.busy_timeout(Duration::from_secs(5))?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
         if use_wal {
@@ -163,25 +180,37 @@ impl ProjectCatalog {
         if integrity != "ok" {
             return Err(CatalogError::Corrupt);
         }
-        let mut catalog = Self { connection };
+        if let Some(path) = path {
+            backup_before_session_class_migration(&connection, path)?;
+        }
+        let mut catalog = Self {
+            connection,
+            automation_title_threshold: automation_title_threshold.max(1),
+        };
         catalog.migrate()?;
+        catalog.refresh_automation_classes()?;
         catalog.restore_legacy_semantic_assignments()?;
         catalog.exclude_ephemeral_agent_assignments()?;
         Ok(catalog)
     }
 
     fn migrate(&mut self) -> Result<(), CatalogError> {
-        let version: u32 = self
+        let mut version: u32 = self
             .connection
             .pragma_query_value(None, "user_version", |row| row.get(0))?;
         if version > CATALOG_SCHEMA_VERSION {
             return Err(CatalogError::UnsupportedSchema(version));
         }
-        if version == CATALOG_SCHEMA_VERSION {
+        if version == 1 {
+            self.migrate_v1_to_v2()?;
+            version = 2;
+        }
+        if version == 2 {
+            self.migrate_v2_to_v3()?;
             return Ok(());
         }
-        if version == 1 {
-            return self.migrate_v1_to_v2();
+        if version == CATALOG_SCHEMA_VERSION {
+            return Ok(());
         }
 
         let transaction = self
@@ -228,6 +257,8 @@ impl ProjectCatalog {
                 -- How much the user actually said, used to skip thin sessions when classifying.
                 user_turns INTEGER NOT NULL DEFAULT 0,
                 user_chars INTEGER NOT NULL DEFAULT 0,
+                session_class TEXT NOT NULL DEFAULT 'interactive'
+                    CHECK (session_class IN ('interactive', 'automation', 'ephemeral')),
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL,
                 UNIQUE(backend, ref_kind, ref_value)
@@ -313,6 +344,7 @@ impl ProjectCatalog {
 
             CREATE INDEX sessions_total_order
                 ON sessions(last_activity_at DESC, stable_key ASC);
+            CREATE INDEX sessions_class ON sessions(session_class);
             CREATE INDEX assignments_project
                 ON assignments(project_id, session_key);
             CREATE INDEX session_sources_root
@@ -324,7 +356,7 @@ impl ProjectCatalog {
             CREATE INDEX semantic_fingerprint
                 ON semantic_assignments(fingerprint);
 
-            PRAGMA user_version = 2;
+            PRAGMA user_version = 3;
             "#,
         )?;
         transaction.commit()?;
@@ -373,6 +405,68 @@ impl ProjectCatalog {
             PRAGMA user_version = 2;
             "#,
         )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Adds server-owned session classification and removes the known classifier feedback rows.
+    fn migrate_v2_to_v3(&mut self) -> Result<(), CatalogError> {
+        let has_session_class = table_has_column(&self.connection, "sessions", "session_class")?;
+        let can_clean_classifier_rows = ["backend", "title", "user_chars"]
+            .into_iter()
+            .map(|column| table_has_column(&self.connection, "sessions", column))
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .all(|present| present)
+            && table_has_column(&self.connection, "assignments", "locked")?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if !has_session_class {
+            transaction.execute_batch(
+                "ALTER TABLE sessions
+                 ADD COLUMN session_class TEXT NOT NULL DEFAULT 'interactive'
+                 CHECK (session_class IN ('interactive', 'automation', 'ephemeral'));",
+            )?;
+        }
+        transaction.execute_batch(
+            "CREATE INDEX IF NOT EXISTS sessions_class ON sessions(session_class);",
+        )?;
+        if can_clean_classifier_rows {
+            transaction.execute_batch(
+                r#"
+                -- F13 must already be present before this one-time cleanup. Preserve anything the
+                -- user explicitly locked even if its metadata resembles a classifier residue.
+                DELETE FROM sessions AS doomed
+                 WHERE doomed.backend = 'opencode'
+                   AND doomed.title LIKE 'New session - %'
+                   AND doomed.user_chars = 0
+                   AND NOT EXISTS (
+                       SELECT 1 FROM assignments a
+                        WHERE a.session_key = doomed.stable_key AND a.locked = 1
+                   );
+                "#,
+            )?;
+        }
+        transaction.pragma_update(None, "user_version", 3)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn refresh_automation_classes(&mut self) -> Result<(), CatalogError> {
+        if !table_has_column(&self.connection, "sessions", "title")? {
+            return Ok(());
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = refresh_automation_classes_in_transaction(
+            &transaction,
+            self.automation_title_threshold,
+        )?;
+        if changed > 0 {
+            bump_revision(&transaction)?;
+        }
         transaction.commit()?;
         Ok(())
     }
@@ -592,6 +686,7 @@ impl ProjectCatalog {
             upsert_aliases(&transaction, &candidate)?;
             upsert_runtime(&transaction, &candidate)?;
         }
+        refresh_automation_classes_in_transaction(&transaction, self.automation_title_threshold)?;
         let revision = bump_revision(&transaction)?;
         transaction.commit()?;
         Ok(revision)
@@ -681,6 +776,7 @@ impl ProjectCatalog {
              JOIN assignments a ON a.session_key = s.stable_key
              LEFT JOIN semantic_assignments sa ON sa.session_key = s.stable_key
              WHERE a.locked = 0
+               AND s.session_class = 'interactive'
                -- Skip throwaway sessions, which otherwise become junk Projects like
                -- \"no clear topic\". Either signal alone is enough to be worth classifying:
                -- a long back-and-forth, or one detailed request. Mirrors
@@ -752,14 +848,19 @@ impl ProjectCatalog {
         for item in batch {
             // Re-check the lock inside the transaction: the user may have locked this session
             // while the classifier was running.
-            let locked: Option<i64> = transaction
+            let eligibility: Option<(i64, String)> = transaction
                 .query_row(
-                    "SELECT locked FROM assignments WHERE session_key = ?1",
+                    "SELECT a.locked, s.session_class
+                     FROM assignments a
+                     JOIN sessions s ON s.stable_key = a.session_key
+                     WHERE a.session_key = ?1",
                     [&item.session_key],
-                    |row| row.get(0),
+                    |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .optional()?;
-            if locked != Some(0) {
+            if eligibility.as_ref().is_none_or(|(locked, session_class)| {
+                *locked != 0 || session_class != SessionClass::Interactive.as_str()
+            }) {
                 continue;
             }
 
@@ -823,6 +924,7 @@ impl ProjectCatalog {
         root_key: &str,
         completion: ScanCompletion,
         seen_source_keys: &HashSet<String>,
+        excluded_source_keys: &HashSet<String>,
         observed_at: i64,
     ) -> Result<u64, CatalogError> {
         let transaction = self
@@ -839,6 +941,20 @@ impl ProjectCatalog {
             .unwrap_or(0);
 
         if completion.is_complete() {
+            for source_key in excluded_source_keys {
+                transaction.execute(
+                    "DELETE FROM sessions
+                     WHERE stable_key IN (
+                         SELECT ss.session_key FROM session_sources ss
+                          WHERE ss.adapter = ?1 AND ss.root_key = ?2 AND ss.source_key = ?3
+                     )
+                       AND NOT EXISTS (
+                           SELECT 1 FROM assignments a
+                            WHERE a.session_key = sessions.stable_key AND a.locked = 1
+                       )",
+                    params![adapter, root_key, source_key],
+                )?;
+            }
             let next_generation = current_generation.saturating_add(1);
             transaction.execute(
                 "INSERT INTO scan_roots(adapter, root_key, successful_generation, state,
@@ -948,12 +1064,14 @@ impl ProjectCatalog {
                 display_name = format!("{display_name} — {canonical_path}");
             }
             let (sessions, next_cursor) = self.sessions_page_by_id(project_id, None, page_size)?;
+            let automation = self.automation_templates_for_project(project_id)?;
             projects.push(ProjectSummary {
                 canonical_key,
                 kind: parse_project_kind(&kind),
                 display_name,
                 canonical_path,
                 sessions,
+                automation,
                 next_cursor,
             });
         }
@@ -968,6 +1086,7 @@ impl ProjectCatalog {
                     MAX(s.last_activity_at) AS latest
              FROM semantic_assignments sa
              JOIN sessions s ON s.stable_key = sa.session_key
+             WHERE s.session_class = 'interactive'
              GROUP BY sa.topic_key
              ORDER BY latest DESC, sa.topic_key ASC",
         )?;
@@ -993,6 +1112,7 @@ impl ProjectCatalog {
                 display_name: topic_label,
                 canonical_path: topic_key,
                 sessions,
+                automation: Vec::new(),
                 next_cursor,
             });
         }
@@ -1072,6 +1192,7 @@ impl ProjectCatalog {
                         workspace_id,
                         pane_id: row.get(8)?,
                         runtime_generation: row.get::<_, Option<i64>>(9)?.map(|value| value as u64),
+                        session_class: parse_session_class(&row.get::<_, String>(10)?),
                     })
                 },
             )?
@@ -1119,6 +1240,7 @@ impl ProjectCatalog {
                         workspace_id,
                         pane_id: row.get(8)?,
                         runtime_generation: row.get::<_, Option<i64>>(9)?.map(|value| value as u64),
+                        session_class: parse_session_class(&row.get::<_, String>(10)?),
                     })
                 },
             )?
@@ -1135,6 +1257,56 @@ impl ProjectCatalog {
             }
         });
         Ok((sessions, next_cursor))
+    }
+
+    fn automation_templates_for_project(
+        &self,
+        project_id: i64,
+    ) -> Result<Vec<AutomationTemplateSummary>, CatalogError> {
+        let rows = {
+            let mut statement = self.connection.prepare(
+                "SELECT s.stable_key, s.title, s.backend, s.last_activity_at
+                 FROM sessions s
+                 JOIN assignments a ON a.session_key = s.stable_key
+                 WHERE a.project_id = ?1
+                   AND a.locked = 0
+                   AND s.session_class = 'automation'
+                 ORDER BY s.last_activity_at DESC, s.stable_key ASC",
+            )?;
+            let rows = statement
+                .query_map([project_id], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows
+        };
+        let mut templates = HashMap::<String, AutomationTemplateSummary>::new();
+        for (stable_key, title, backend, last_activity_at) in rows {
+            let normalized = normalize_session_title(&title);
+            let entry = templates
+                .entry(normalized)
+                .or_insert_with(|| AutomationTemplateSummary {
+                    representative_session_key: stable_key,
+                    title,
+                    backend,
+                    count: 0,
+                    last_activity_at,
+                });
+            entry.count = entry.count.saturating_add(1);
+        }
+        let mut templates = templates.into_values().collect::<Vec<_>>();
+        templates.sort_by(|left, right| {
+            right
+                .last_activity_at
+                .cmp(&left.last_activity_at)
+                .then_with(|| left.title.cmp(&right.title))
+        });
+        Ok(templates)
     }
 
     #[cfg(test)]
@@ -1162,6 +1334,109 @@ fn table_has_column(
         |row| row.get(0),
     )?;
     Ok(exists)
+}
+
+fn table_exists(connection: &Connection, table: &str) -> Result<bool, CatalogError> {
+    Ok(connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+        [table],
+        |row| row.get(0),
+    )?)
+}
+
+/// Creates a transactionally consistent copy before the first session-class migration.
+///
+/// `VACUUM INTO` reads through SQLite itself, so committed WAL pages are included. A raw file copy
+/// could silently omit them and produce a backup older than the Catalog being migrated.
+fn backup_before_session_class_migration(
+    connection: &Connection,
+    path: &Path,
+) -> Result<(), CatalogError> {
+    let version: u32 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if version == 0
+        || version >= 3
+        || !table_exists(connection, "sessions")?
+        || table_has_column(connection, "sessions", "session_class")?
+    {
+        return Ok(());
+    }
+    let date: String =
+        connection.query_row("SELECT strftime('%Y%m%d', 'now', 'localtime')", [], |row| {
+            row.get(0)
+        })?;
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("catalog.sqlite3");
+    let mut backup = path.with_file_name(format!("{file_name}.pre-session-class-{date}"));
+    for suffix in 1..=100 {
+        if !backup.exists() {
+            let backup_value = backup.to_string_lossy().into_owned();
+            connection.execute("VACUUM INTO ?1", [backup_value])?;
+            tracing::info!(
+                category = "catalog_backup",
+                path = %backup.display(),
+                "Backed up Project Catalog before session-class migration"
+            );
+            return Ok(());
+        }
+        backup = path.with_file_name(format!("{file_name}.pre-session-class-{date}-{suffix}"));
+    }
+    Err(CatalogError::Io(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "could not allocate a unique session-class backup path",
+    )))
+}
+
+fn refresh_automation_classes_in_transaction(
+    transaction: &Transaction<'_>,
+    threshold: usize,
+) -> Result<usize, CatalogError> {
+    let rows = {
+        let mut statement = transaction
+            .prepare("SELECT stable_key, title FROM sessions ORDER BY stable_key ASC")?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows
+    };
+    let mut groups = HashMap::<String, Vec<String>>::new();
+    for (stable_key, title) in rows {
+        let normalized = normalize_session_title(&title);
+        if !normalized.is_empty() {
+            groups.entry(normalized).or_default().push(stable_key);
+        }
+    }
+
+    let mut changed = 0usize;
+    let mut update = transaction.prepare(
+        "UPDATE sessions SET session_class = 'automation'
+         WHERE stable_key = ?1 AND session_class != 'automation'",
+    )?;
+    for stable_keys in groups
+        .values()
+        .filter(|stable_keys| stable_keys.len() >= threshold.max(1))
+    {
+        for stable_key in stable_keys {
+            changed = changed.saturating_add(update.execute([stable_key])?);
+        }
+    }
+    drop(update);
+    changed = changed.saturating_add(transaction.execute(
+        "DELETE FROM semantic_assignments
+         WHERE session_key IN (
+             SELECT s.stable_key FROM sessions s
+             WHERE s.session_class = 'automation'
+               AND NOT EXISTS (
+                   SELECT 1 FROM assignments a
+                    WHERE a.session_key = s.stable_key AND a.locked = 1
+               )
+         )",
+        [],
+    )?);
+    Ok(changed)
 }
 
 fn resolve_alias_primary(
@@ -1259,8 +1534,9 @@ fn upsert_session(
         "INSERT INTO sessions(
            stable_key, backend, ref_kind, ref_value, title, title_observed_at,
            title_priority, title_source_key, first_activity_at, last_activity_at,
-           user_turns, user_chars, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?12, ?13, ?11, ?11)
+           user_turns, user_chars, session_class, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?12, ?13,
+                 COALESCE(?14, 'interactive'), ?11, ?11)
          ON CONFLICT(stable_key) DO UPDATE SET
            first_activity_at = MIN(first_activity_at, excluded.first_activity_at),
            last_activity_at = MAX(last_activity_at, excluded.last_activity_at),
@@ -1268,6 +1544,10 @@ fn upsert_session(
            -- overwrite what the file scan measured.
            user_turns = MAX(user_turns, excluded.user_turns),
            user_chars = MAX(user_chars, excluded.user_chars),
+           session_class = CASE
+               WHEN ?14 IS NULL THEN session_class
+               ELSE ?14
+           END,
            updated_at = MAX(updated_at, excluded.updated_at)",
         params![
             candidate.identity.stable_key,
@@ -1282,7 +1562,8 @@ fn upsert_session(
             candidate.last_activity_at,
             candidate.observed_at,
             candidate.weight.turns as i64,
-            candidate.weight.chars as i64
+            candidate.weight.chars as i64,
+            candidate.session_class.map(SessionClass::as_str)
         ],
     )?;
 
@@ -1352,9 +1633,11 @@ fn reconcile_semantic_assignment(
 ) -> Result<(), CatalogError> {
     let metadata = transaction
         .query_row(
-            "SELECT s.title, s.cwd, s.backend, sa.fingerprint
+            "SELECT s.title, s.cwd, s.backend, sa.fingerprint, s.session_class,
+                    COALESCE(a.locked, 0)
              FROM sessions s
              JOIN semantic_assignments sa ON sa.session_key = s.stable_key
+             LEFT JOIN assignments a ON a.session_key = s.stable_key
              WHERE s.stable_key = ?1",
             [stable_key],
             |row| {
@@ -1363,15 +1646,19 @@ fn reconcile_semantic_assignment(
                     row.get::<_, Option<String>>(1)?,
                     row.get::<_, String>(2)?,
                     row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, i64>(5)?,
                 ))
             },
         )
         .optional()?;
-    let Some((title, cwd, backend, stored_fingerprint)) = metadata else {
+    let Some((title, cwd, backend, stored_fingerprint, session_class, locked)) = metadata else {
         return Ok(());
     };
     let current_fingerprint = super::semantic_fingerprint(&title, cwd.as_deref(), &backend);
-    if stored_fingerprint != current_fingerprint {
+    if stored_fingerprint != current_fingerprint
+        || (session_class != SessionClass::Interactive.as_str() && locked == 0)
+    {
         transaction.execute(
             "DELETE FROM semantic_assignments WHERE session_key = ?1",
             [stable_key],
@@ -1586,6 +1873,14 @@ fn parse_ref_kind(value: &str) -> SessionRefKind {
     }
 }
 
+fn parse_session_class(value: &str) -> SessionClass {
+    match value {
+        "automation" => SessionClass::Automation,
+        "ephemeral" => SessionClass::Ephemeral,
+        _ => SessionClass::Interactive,
+    }
+}
+
 fn parse_project_kind(value: &str) -> ProjectKind {
     match value {
         "git-common-dir" => ProjectKind::GitCommonDir,
@@ -1601,6 +1896,19 @@ mod tests {
     use crate::projects::{
         CandidateField, RuntimeMapping, SessionAliasCandidate, SessionIdentity, SourcePriority,
     };
+
+    fn temp_dir(label: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "ork3-catalog-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&path).expect("catalog fixture root");
+        path
+    }
 
     fn candidate(backend: &str, id: &str, last: i64) -> SessionCandidate {
         let identity = SessionIdentity::id(backend, id).expect("identity");
@@ -1623,6 +1931,7 @@ mod tests {
             aliases: Vec::new(),
             runtime: None,
             weight: Default::default(),
+            session_class: Some(super::super::SessionClass::Interactive),
         }
     }
 
@@ -1649,6 +1958,163 @@ mod tests {
             assert!(columns.iter().all(|column| !column.contains("fold")));
             assert!(columns.iter().all(|column| !column.contains("collapse")));
         }
+        assert!(catalog
+            .table_columns("sessions")
+            .expect("session columns")
+            .iter()
+            .any(|column| column == "session_class"));
+        let class_index: i64 = catalog
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'index' AND name = 'sessions_class'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("session class index");
+        assert_eq!(class_index, 1);
+    }
+
+    #[test]
+    fn repeated_titles_become_one_automation_template_idempotently() {
+        let connection = Connection::open_in_memory().expect("database");
+        let mut catalog =
+            ProjectCatalog::initialize(connection, false, None, 2).expect("low-threshold catalog");
+        let mut first = candidate("codex", "repeat-a", 10);
+        let mut second = candidate("codex", "repeat-b", 20);
+        first.title.as_mut().expect("title").value = "Nightly   Watchdog".to_string();
+        second.title.as_mut().expect("title").value = "nightly watchdog".to_string();
+        first.weight = super::super::adapters::SessionWeight {
+            turns: 4,
+            chars: 100,
+        };
+        second.weight = first.weight;
+
+        catalog
+            .upsert_scanned_candidates(&[first, second])
+            .expect("scan batch");
+        let snapshot = catalog.snapshot(50).expect("automation snapshot");
+        assert_eq!(snapshot.projects.len(), 1);
+        assert!(snapshot.projects[0].sessions.is_empty());
+        assert_eq!(snapshot.projects[0].automation.len(), 1);
+        assert_eq!(snapshot.projects[0].automation[0].count, 2);
+        assert!(catalog
+            .pending_semantic_sessions(10)
+            .expect("pending")
+            .is_empty());
+        let stored: i64 = catalog
+            .connection
+            .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
+            .expect("stored sessions");
+        assert_eq!(stored, 2, "Sessions/search data must remain available");
+
+        let revision = catalog.revision().expect("revision");
+        catalog
+            .refresh_automation_classes()
+            .expect("idempotent refresh");
+        assert_eq!(catalog.revision().expect("revision"), revision);
+    }
+
+    #[test]
+    fn explicit_automation_is_hidden_without_waiting_for_title_threshold() {
+        let mut catalog = ProjectCatalog::open_in_memory().expect("catalog");
+        let mut item = candidate("codex", "exec", 10);
+        item.session_class = Some(SessionClass::Automation);
+        item.weight = super::super::adapters::SessionWeight {
+            turns: 10,
+            chars: 500,
+        };
+        catalog
+            .upsert_scanned_candidates(&[item])
+            .expect("automation scan");
+        let snapshot = catalog.snapshot(50).expect("snapshot");
+        assert!(snapshot.projects[0].sessions.is_empty());
+        assert_eq!(snapshot.projects[0].automation[0].count, 1);
+        assert!(snapshot.topics.is_empty());
+    }
+
+    #[test]
+    fn v2_migration_backs_up_wal_and_preserves_locked_classifier_like_rows() {
+        let root = temp_dir("session-class-backup");
+        let path = root.join("catalog.sqlite3");
+        let mut catalog = ProjectCatalog::open(&path).expect("seed catalog");
+        let mut unlocked = candidate("opencode", "garbage-unlocked", 10);
+        unlocked.title.as_mut().expect("title").value =
+            "New session - 2026-08-17T01:00:00Z".to_string();
+        let mut locked = candidate("opencode", "garbage-locked", 20);
+        locked.title.as_mut().expect("title").value =
+            "New session - 2026-08-17T02:00:00Z".to_string();
+        catalog.upsert_candidate(&unlocked).expect("unlocked row");
+        catalog.upsert_candidate(&locked).expect("locked row");
+        catalog
+            .connection
+            .execute(
+                "UPDATE assignments SET locked = 1 WHERE session_key = ?1",
+                [&locked.identity.stable_key],
+            )
+            .expect("lock row");
+        drop(catalog);
+
+        let writer = Connection::open(&path).expect("downgrade connection");
+        writer
+            .execute_batch(
+                "DROP INDEX sessions_class;
+                 ALTER TABLE sessions DROP COLUMN session_class;
+                 PRAGMA user_version = 2;
+                 PRAGMA journal_mode = WAL;
+                 PRAGMA wal_autocheckpoint = 0;",
+            )
+            .expect("v2 schema");
+        writer
+            .execute(
+                "UPDATE sessions SET title = ?2 WHERE stable_key = ?1",
+                params![
+                    locked.identity.stable_key,
+                    "New session - 2026-08-17T02:00:01Z"
+                ],
+            )
+            .expect("committed WAL update");
+
+        let migrated = ProjectCatalog::open(&path).expect("migrated catalog");
+        let remaining: Vec<String> = migrated
+            .connection
+            .prepare("SELECT stable_key FROM sessions ORDER BY stable_key")
+            .expect("remaining statement")
+            .query_map([], |row| row.get(0))
+            .expect("remaining rows")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("remaining rows");
+        assert_eq!(remaining, vec![locked.identity.stable_key.clone()]);
+
+        let backup = std::fs::read_dir(&root)
+            .expect("backup directory")
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|candidate| {
+                candidate
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .is_some_and(|name| name.contains(".pre-session-class-"))
+            })
+            .expect("session-class backup");
+        let backup_connection = Connection::open(backup).expect("backup database");
+        let backup_rows: i64 = backup_connection
+            .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
+            .expect("backup rows");
+        assert_eq!(backup_rows, 2, "backup must precede cleanup");
+        let backed_up_title: String = backup_connection
+            .query_row(
+                "SELECT title FROM sessions WHERE stable_key = ?1",
+                [&locked.identity.stable_key],
+                |row| row.get(0),
+            )
+            .expect("WAL-backed title");
+        assert_eq!(backed_up_title, "New session - 2026-08-17T02:00:01Z");
+
+        drop(backup_connection);
+        drop(migrated);
+        drop(writer);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -1666,7 +2132,7 @@ mod tests {
             )
             .expect("legacy schema");
 
-        let catalog = ProjectCatalog::initialize(connection, false).expect("migrate v1");
+        let catalog = ProjectCatalog::initialize(connection, false, None, 20).expect("migrate v1");
         let columns = catalog.table_columns("sessions").expect("session columns");
         assert!(columns.iter().any(|column| column == "user_turns"));
         assert!(columns.iter().any(|column| column == "user_chars"));
@@ -1712,7 +2178,8 @@ mod tests {
             )
             .expect("partial v1 schema");
 
-        let catalog = ProjectCatalog::initialize(connection, false).expect("migrate partial v1");
+        let catalog =
+            ProjectCatalog::initialize(connection, false, None, 20).expect("migrate partial v1");
         let version: u32 = catalog
             .connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
@@ -1936,8 +2403,9 @@ mod tests {
             )
             .expect("seed legacy overwrite");
 
-        let ProjectCatalog { connection } = catalog;
-        let restored = ProjectCatalog::initialize(connection, false).expect("restore legacy");
+        let ProjectCatalog { connection, .. } = catalog;
+        let restored =
+            ProjectCatalog::initialize(connection, false, None, 20).expect("restore legacy");
         let snapshot = restored.snapshot(50).expect("snapshot");
         assert_eq!(snapshot.projects.len(), 1);
         assert_ne!(snapshot.projects[0].kind, ProjectKind::Semantic);
@@ -2017,8 +2485,9 @@ mod tests {
             )
             .expect("seed disposable cwd");
 
-        let ProjectCatalog { connection } = catalog;
-        let repaired = ProjectCatalog::initialize(connection, false).expect("repair catalog");
+        let ProjectCatalog { connection, .. } = catalog;
+        let repaired =
+            ProjectCatalog::initialize(connection, false, None, 20).expect("repair catalog");
         assert!(repaired
             .snapshot(50)
             .expect("after repair")
@@ -2430,7 +2899,7 @@ mod tests {
             ScanCompletion::Failed,
         ] {
             catalog
-                .complete_root_scan(&item.adapter, &item.root_key, outcome, &empty, 2)
+                .complete_root_scan(&item.adapter, &item.root_key, outcome, &empty, &empty, 2)
                 .unwrap();
         }
         assert_source_state(&catalog, &item, "present", 0);
@@ -2440,6 +2909,7 @@ mod tests {
                 &item.adapter,
                 &item.root_key,
                 ScanCompletion::Complete,
+                &empty,
                 &empty,
                 3,
             )
@@ -2451,6 +2921,7 @@ mod tests {
                 &item.root_key,
                 ScanCompletion::Failed,
                 &empty,
+                &empty,
                 4,
             )
             .unwrap();
@@ -2460,6 +2931,7 @@ mod tests {
                 &item.adapter,
                 &item.root_key,
                 ScanCompletion::Complete,
+                &empty,
                 &empty,
                 5,
             )
@@ -2474,6 +2946,7 @@ mod tests {
                 &item.root_key,
                 ScanCompletion::Complete,
                 &seen,
+                &empty,
                 6,
             )
             .unwrap();
@@ -2482,17 +2955,67 @@ mod tests {
     }
 
     #[test]
+    fn completed_scan_purges_known_artifacts_but_preserves_manual_locks() {
+        let mut catalog = ProjectCatalog::open_in_memory().expect("catalog");
+        let artifact = candidate("opencode", "artifact", 1);
+        let locked = candidate("opencode", "locked-artifact", 2);
+        catalog.upsert_candidate(&artifact).expect("artifact");
+        catalog.upsert_candidate(&locked).expect("locked artifact");
+        catalog
+            .connection
+            .execute(
+                "UPDATE assignments SET locked = 1 WHERE session_key = ?1",
+                [&locked.identity.stable_key],
+            )
+            .expect("manual lock");
+        let excluded = HashSet::from([artifact.source_key.clone(), locked.source_key.clone()]);
+        let empty = HashSet::new();
+
+        catalog
+            .complete_root_scan(
+                "opencode",
+                &artifact.root_key,
+                ScanCompletion::Complete,
+                &empty,
+                &excluded,
+                3,
+            )
+            .expect("complete scan");
+
+        let remaining = catalog
+            .connection
+            .query_row("SELECT COUNT(*) FROM sessions", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .expect("remaining sessions");
+        assert_eq!(remaining, 1);
+        let remaining_key: String = catalog
+            .connection
+            .query_row("SELECT stable_key FROM sessions", [], |row| row.get(0))
+            .expect("locked key");
+        assert_eq!(remaining_key, locked.identity.stable_key);
+    }
+
+    #[test]
     fn scan_status_aggregates_valid_and_invalid_roots_per_adapter() {
         let mut catalog = ProjectCatalog::open_in_memory().expect("catalog");
         let empty = HashSet::new();
         catalog
-            .complete_root_scan("codex", "default", ScanCompletion::NotInstalled, &empty, 1)
+            .complete_root_scan(
+                "codex",
+                "default",
+                ScanCompletion::NotInstalled,
+                &empty,
+                &empty,
+                1,
+            )
             .expect("default missing");
         catalog
             .complete_root_scan(
                 "codex",
                 "configured-valid",
                 ScanCompletion::Complete,
+                &empty,
                 &empty,
                 2,
             )
@@ -2506,6 +3029,7 @@ mod tests {
                 "codex",
                 "configured-invalid",
                 ScanCompletion::ConfigurationError,
+                &empty,
                 &empty,
                 3,
             )

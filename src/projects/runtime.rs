@@ -70,6 +70,7 @@ pub(crate) fn candidate_from_report(input: RuntimeCandidateInput<'_>) -> Session
         }),
         // A runtime report carries no transcript, so weight comes from the file scan instead.
         weight: super::adapters::SessionWeight::default(),
+        session_class: None,
     }
 }
 
