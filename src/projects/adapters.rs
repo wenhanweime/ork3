@@ -1891,7 +1891,7 @@ mod tests {
     #[test]
     fn percent_decoding_handles_grok_working_directory() {
         assert_eq!(
-            percent_decode("%2FUsers%2Fpot%2FDocuments%2Fait").as_deref(),
+            percent_decode("%2FUsers%2Fexample%2FDocuments%2Fait").as_deref(),
             Some("/Users/example/Documents/ait")
         );
         assert_eq!(percent_decode("%ZZ"), None);

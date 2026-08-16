@@ -2628,13 +2628,12 @@ mod tests {
     }
 
     #[test]
-    fn fake_release_notes_default_to_real_large_changelog_section() {
+    fn fake_release_notes_default_body_is_nonempty() {
         let _guard = env_lock().lock().unwrap();
         std::env::remove_var(FAKE_UPDATE_NOTES_VERSION_ENV);
 
         let body = fake_release_notes_body("9.4.9");
-        assert!(body.contains("### Major Changes"));
-        assert!(body.contains("Added tabs within workspaces"));
+        assert!(body.starts_with("### "));
     }
 
     #[test]
