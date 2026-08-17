@@ -22,6 +22,7 @@ pub(crate) enum ProjectTreeRow {
     },
     Session(IndexedSessionSummary),
     Automation(AutomationTemplateSummary),
+    Thin(usize),
     LoadOlder {
         project_key: String,
     },
@@ -57,7 +58,7 @@ impl ProjectTreeRow {
                 };
                 Some(ProjectTreeAction::Activate(activation))
             }
-            Self::Automation(_) => None,
+            Self::Automation(_) | Self::Thin(_) => None,
             Self::LoadOlder { project_key } => Some(ProjectTreeAction::LoadOlder {
                 project_key: project_key.clone(),
             }),
@@ -149,7 +150,22 @@ pub(crate) fn project_tree_rows(app: &AppState) -> Vec<ProjectTreeRow> {
             kind: project.kind,
         });
         if !collapsed {
-            rows.extend(sessions.into_iter().map(ProjectTreeRow::Session));
+            let collapse_thin = query.is_empty() && app.projects.filter == ProjectFilter::All;
+            let thin = if collapse_thin {
+                sessions.len().min(project.thin_count as usize)
+            } else {
+                0
+            };
+            let substantive_len = sessions.len().saturating_sub(thin);
+            rows.extend(
+                sessions
+                    .into_iter()
+                    .take(substantive_len)
+                    .map(ProjectTreeRow::Session),
+            );
+            if thin > 0 {
+                rows.push(ProjectTreeRow::Thin(thin));
+            }
             rows.extend(automation.into_iter().map(ProjectTreeRow::Automation));
             if project.next_cursor.is_some() && app.projects.filter == ProjectFilter::All {
                 rows.push(ProjectTreeRow::LoadOlder {
@@ -482,6 +498,10 @@ pub(crate) fn render_projects_sidebar(app: &AppState, frame: &mut Frame, area: R
                     Style::default().fg(app.palette.overlay0),
                 ),
             ]),
+            ProjectTreeRow::Thin(count) => Line::from(Span::styled(
+                format!("  +{count} short sessions"),
+                Style::default().fg(app.palette.surface_dim),
+            )),
             ProjectTreeRow::LoadOlder { .. } => Line::from(Span::styled(
                 "  Load older…",
                 Style::default().fg(app.palette.accent),
@@ -579,6 +599,7 @@ mod tests {
                     session_class: crate::projects::SessionClass::Interactive,
                 }],
                 automation: Vec::new(),
+                thin_count: 0,
                 next_cursor: None,
             }],
             topics: Vec::new(),

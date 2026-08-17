@@ -8425,6 +8425,13 @@
                 "$ref": "#/schemas/success_response/$defs/IndexedSessionSummary"
               },
               "type": "array"
+            },
+            "thin_count": {
+              "default": 0,
+              "description": "Interactive sessions below the substantive threshold, retained but collapsed by clients.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
             }
           },
           "required": [

@@ -1187,6 +1187,7 @@ mod tests {
                 canonical_path: "/tmp/project-live".into(),
                 sessions: vec![session],
                 automation: Vec::new(),
+                thin_count: 0,
                 next_cursor: None,
             }],
             topics: Vec::new(),

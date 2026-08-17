@@ -498,6 +498,9 @@ pub struct ProjectSummary {
     /// Repeated automation templates stay visible as one collapsed row under their cwd Project.
     #[serde(default)]
     pub automation: Vec<AutomationTemplateSummary>,
+    /// Interactive sessions below the substantive threshold, retained but collapsed by clients.
+    #[serde(default)]
+    pub thin_count: u64,
     pub next_cursor: Option<SessionCursor>,
 }
 

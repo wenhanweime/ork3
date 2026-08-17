@@ -23,7 +23,8 @@ const CATALOG_SCHEMA_VERSION: u32 = 4;
 /// `sessions_page_query_uses_the_total_order_index` guards against.
 const SESSIONS_PAGE_SQL: &str = "SELECT s.stable_key, s.backend, s.ref_kind, s.title, s.cwd,
             s.first_activity_at, s.last_activity_at,
-            r.workspace_id, r.pane_id, r.generation, s.session_class
+            r.workspace_id, r.pane_id, r.generation, s.session_class,
+            s.user_weight_known, s.user_turns, s.user_chars
      FROM sessions s
      CROSS JOIN assignments a ON a.session_key = s.stable_key
      LEFT JOIN runtime_mappings r ON r.session_key = s.stable_key
@@ -40,7 +41,8 @@ const SESSIONS_PAGE_SQL: &str = "SELECT s.stable_key, s.backend, s.ref_kind, s.t
 /// in `assignments` and is never replaced by an inferred topic.
 const TOPIC_SESSIONS_PAGE_SQL: &str = "SELECT s.stable_key, s.backend, s.ref_kind, s.title, s.cwd,
             s.first_activity_at, s.last_activity_at,
-            r.workspace_id, r.pane_id, r.generation, s.session_class
+            r.workspace_id, r.pane_id, r.generation, s.session_class,
+            s.user_weight_known, s.user_turns, s.user_chars
      FROM sessions s
      CROSS JOIN semantic_assignments sa ON sa.session_key = s.stable_key
      LEFT JOIN runtime_mappings r ON r.session_key = s.stable_key
@@ -1228,14 +1230,19 @@ impl ProjectCatalog {
         let page_size = page_size.clamp(1, 500);
         let mut projects_statement = self.connection.prepare(
             "SELECT p.id, p.canonical_key, p.kind, p.display_name, p.canonical_path,
-                    MAX(s.last_activity_at) AS latest
+                    MAX(s.last_activity_at) AS latest,
+                    MAX(CASE WHEN s.session_class = 'interactive'
+                                  AND s.user_weight_known = 1
+                                  AND s.user_chars >= 24
+                                  AND (s.user_turns >= 4 OR s.user_chars >= 80)
+                             THEN 1 ELSE 0 END) AS has_substantive
              FROM projects p
              JOIN assignments a ON a.project_id = p.id
              JOIN sessions s ON s.stable_key = a.session_key
              WHERE p.kind != 'semantic'
                AND a.evidence != 'ephemeral-agent-cwd'
              GROUP BY p.id
-             ORDER BY latest DESC, p.canonical_key ASC",
+             ORDER BY has_substantive DESC, latest DESC, p.canonical_key ASC",
         )?;
         let raw_projects = projects_statement
             .query_map([], |row| {
@@ -1245,23 +1252,25 @@ impl ProjectCatalog {
                     row.get::<_, String>(2)?,
                     row.get::<_, String>(3)?,
                     row.get::<_, String>(4)?,
+                    row.get::<_, i64>(5)?,
                 ))
             })?
             .collect::<Result<Vec<_>, _>>()?;
         drop(projects_statement);
 
         let mut name_counts = HashMap::<String, usize>::new();
-        for (_, _, _, display_name, _) in &raw_projects {
+        for (_, _, _, display_name, _, _) in &raw_projects {
             *name_counts.entry(display_name.clone()).or_default() += 1;
         }
 
         let mut projects = Vec::with_capacity(raw_projects.len());
-        for (project_id, canonical_key, kind, mut display_name, canonical_path) in raw_projects {
+        for (project_id, canonical_key, kind, mut display_name, canonical_path, _) in raw_projects {
             if name_counts.get(&display_name).copied().unwrap_or_default() > 1 {
                 display_name = format!("{display_name} — {canonical_path}");
             }
             let (sessions, next_cursor) = self.sessions_page_by_id(project_id, None, page_size)?;
             let automation = self.automation_templates_for_project(project_id)?;
+            let thin_count = self.thin_count_for_project(project_id)?;
             projects.push(ProjectSummary {
                 canonical_key,
                 kind: parse_project_kind(&kind),
@@ -1269,6 +1278,7 @@ impl ProjectCatalog {
                 canonical_path,
                 sessions,
                 automation,
+                thin_count,
                 next_cursor,
             });
         }
@@ -1280,12 +1290,16 @@ impl ProjectCatalog {
                      WHERE latest.topic_key = sa.topic_key
                      ORDER BY latest.classified_at DESC, latest.session_key ASC
                      LIMIT 1) AS topic_label,
-                    MAX(s.last_activity_at) AS latest
+                    MAX(s.last_activity_at) AS latest,
+                    MAX(CASE WHEN s.user_weight_known = 1
+                                  AND s.user_chars >= 24
+                                  AND (s.user_turns >= 4 OR s.user_chars >= 80)
+                             THEN 1 ELSE 0 END) AS has_substantive
              FROM semantic_assignments sa
              JOIN sessions s ON s.stable_key = sa.session_key
              WHERE s.session_class = 'interactive'
              GROUP BY sa.topic_key
-             ORDER BY latest DESC, sa.topic_key ASC",
+             ORDER BY has_substantive DESC, latest DESC, sa.topic_key ASC",
         )?;
         let raw_topics = topics_statement
             .query_map([], |row| {
@@ -1303,6 +1317,7 @@ impl ProjectCatalog {
                 "semantic".to_string(),
             );
             let (sessions, next_cursor) = self.topic_sessions_page(&topic_key, None, page_size)?;
+            let thin_count = self.thin_count_for_topic(&topic_key)?;
             topics.push(ProjectSummary {
                 canonical_key: classification.canonical_key,
                 kind: ProjectKind::Semantic,
@@ -1310,6 +1325,7 @@ impl ProjectCatalog {
                 canonical_path: topic_key,
                 sessions,
                 automation: Vec::new(),
+                thin_count,
                 next_cursor,
             });
         }
@@ -1337,6 +1353,40 @@ impl ProjectCatalog {
             scan_status,
             diagnostic_category: None,
         })
+    }
+
+    fn thin_count_for_project(&self, project_id: i64) -> Result<u64, CatalogError> {
+        Ok(self.connection.query_row(
+            "SELECT COUNT(*) FROM sessions s
+             JOIN assignments a ON a.session_key = s.stable_key
+             WHERE a.project_id = ?1 AND s.session_class = 'interactive'
+               AND NOT (s.user_weight_known = 1 AND s.user_chars >= ?2
+                        AND (s.user_turns >= ?3 OR s.user_chars >= ?4))",
+            params![
+                project_id,
+                super::adapters::MIN_ANY_CHARS as i64,
+                super::adapters::MIN_SUBSTANTIVE_TURNS as i64,
+                super::adapters::MIN_SUBSTANTIVE_CHARS as i64,
+            ],
+            |row| row.get::<_, i64>(0),
+        )? as u64)
+    }
+
+    fn thin_count_for_topic(&self, topic_key: &str) -> Result<u64, CatalogError> {
+        Ok(self.connection.query_row(
+            "SELECT COUNT(*) FROM sessions s
+             JOIN semantic_assignments sa ON sa.session_key = s.stable_key
+             WHERE sa.topic_key = ?1 AND s.session_class = 'interactive'
+               AND NOT (s.user_weight_known = 1 AND s.user_chars >= ?2
+                        AND (s.user_turns >= ?3 OR s.user_chars >= ?4))",
+            params![
+                topic_key,
+                super::adapters::MIN_ANY_CHARS as i64,
+                super::adapters::MIN_SUBSTANTIVE_TURNS as i64,
+                super::adapters::MIN_SUBSTANTIVE_CHARS as i64,
+            ],
+            |row| row.get::<_, i64>(0),
+        )? as u64)
     }
 
     pub(crate) fn sessions_page(
@@ -1377,7 +1427,7 @@ impl ProjectCatalog {
                 |row| {
                     let ref_kind: String = row.get(2)?;
                     let workspace_id: Option<String> = row.get(7)?;
-                    Ok(IndexedSessionSummary {
+                    let summary = IndexedSessionSummary {
                         stable_key: row.get(0)?,
                         backend: row.get(1)?,
                         ref_kind: parse_ref_kind(&ref_kind),
@@ -1390,23 +1440,38 @@ impl ProjectCatalog {
                         pane_id: row.get(8)?,
                         runtime_generation: row.get::<_, Option<i64>>(9)?.map(|value| value as u64),
                         session_class: parse_session_class(&row.get::<_, String>(10)?),
-                    })
+                    };
+                    let thin = row.get::<_, i64>(11)? == 0
+                        || row.get::<_, i64>(13)? < super::adapters::MIN_ANY_CHARS as i64
+                        || (row.get::<_, i64>(12)? < super::adapters::MIN_SUBSTANTIVE_TURNS as i64
+                            && row.get::<_, i64>(13)?
+                                < super::adapters::MIN_SUBSTANTIVE_CHARS as i64);
+                    Ok((summary, thin))
                 },
             )?
             .collect::<Result<Vec<_>, _>>()?;
         let has_more = sessions.len() > limit;
+        sessions.sort_by(|left, right| {
+            left.1
+                .cmp(&right.1)
+                .then_with(|| right.0.last_activity_at.cmp(&left.0.last_activity_at))
+                .then_with(|| left.0.stable_key.cmp(&right.0.stable_key))
+        });
         if has_more {
             sessions.pop();
         }
         let next_cursor = has_more && !sessions.is_empty();
         let next_cursor = next_cursor.then(|| {
-            let last = &sessions[sessions.len() - 1];
+            let last = &sessions[sessions.len() - 1].0;
             SessionCursor {
                 last_activity_at: last.last_activity_at,
                 stable_key: last.stable_key.clone(),
             }
         });
-        Ok((sessions, next_cursor))
+        Ok((
+            sessions.into_iter().map(|(summary, _)| summary).collect(),
+            next_cursor,
+        ))
     }
 
     fn topic_sessions_page(
@@ -1425,7 +1490,7 @@ impl ProjectCatalog {
                 |row| {
                     let ref_kind: String = row.get(2)?;
                     let workspace_id: Option<String> = row.get(7)?;
-                    Ok(IndexedSessionSummary {
+                    let summary = IndexedSessionSummary {
                         stable_key: row.get(0)?,
                         backend: row.get(1)?,
                         ref_kind: parse_ref_kind(&ref_kind),
@@ -1438,22 +1503,37 @@ impl ProjectCatalog {
                         pane_id: row.get(8)?,
                         runtime_generation: row.get::<_, Option<i64>>(9)?.map(|value| value as u64),
                         session_class: parse_session_class(&row.get::<_, String>(10)?),
-                    })
+                    };
+                    let thin = row.get::<_, i64>(11)? == 0
+                        || row.get::<_, i64>(13)? < super::adapters::MIN_ANY_CHARS as i64
+                        || (row.get::<_, i64>(12)? < super::adapters::MIN_SUBSTANTIVE_TURNS as i64
+                            && row.get::<_, i64>(13)?
+                                < super::adapters::MIN_SUBSTANTIVE_CHARS as i64);
+                    Ok((summary, thin))
                 },
             )?
             .collect::<Result<Vec<_>, _>>()?;
         let has_more = sessions.len() > limit;
+        sessions.sort_by(|left, right| {
+            left.1
+                .cmp(&right.1)
+                .then_with(|| right.0.last_activity_at.cmp(&left.0.last_activity_at))
+                .then_with(|| left.0.stable_key.cmp(&right.0.stable_key))
+        });
         if has_more {
             sessions.pop();
         }
         let next_cursor = (has_more && !sessions.is_empty()).then(|| {
-            let last = &sessions[sessions.len() - 1];
+            let last = &sessions[sessions.len() - 1].0;
             SessionCursor {
                 last_activity_at: last.last_activity_at,
                 stable_key: last.stable_key.clone(),
             }
         });
-        Ok((sessions, next_cursor))
+        Ok((
+            sessions.into_iter().map(|(summary, _)| summary).collect(),
+            next_cursor,
+        ))
     }
 
     fn automation_templates_for_project(
@@ -3527,5 +3607,40 @@ mod tests {
         assert_eq!(sessions[0].title, "title-recent");
         assert!(!sessions[0].live);
         assert!(sessions[1].live);
+    }
+
+    #[test]
+    fn snapshot_reports_thin_count_and_places_thin_only_projects_last() {
+        let mut catalog = ProjectCatalog::open_in_memory().expect("catalog");
+        let thin_root = temp_dir("thin-project");
+        let substantive_root = temp_dir("substantive-project");
+        let mut thin = candidate("codex", "thin-project", 30);
+        thin.cwd = Some(CandidateField {
+            value: thin_root.clone(),
+            observed_at: 30,
+            priority: SourcePriority::PrimaryIndex,
+            source_key: "thin-cwd".to_string(),
+        });
+        let mut substantive = candidate("codex", "substantive-project", 20);
+        substantive.cwd = Some(CandidateField {
+            value: substantive_root.clone(),
+            observed_at: 20,
+            priority: SourcePriority::PrimaryIndex,
+            source_key: "substantive-cwd".to_string(),
+        });
+        substantive.weight = super::super::adapters::SessionWeight {
+            turns: 4,
+            chars: 120,
+            known: true,
+        };
+        catalog
+            .upsert_scanned_candidates(&[thin, substantive])
+            .expect("sessions");
+        let projects = catalog.snapshot(50).expect("snapshot").projects;
+        assert_eq!(projects.len(), 2);
+        assert_eq!(projects[0].thin_count, 0);
+        assert_eq!(projects[1].thin_count, 1);
+        let _ = std::fs::remove_dir_all(thin_root);
+        let _ = std::fs::remove_dir_all(substantive_root);
     }
 }
