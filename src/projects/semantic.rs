@@ -543,14 +543,86 @@ fn run_classification_pass(
         if shutdown.load(std::sync::atomic::Ordering::Acquire) {
             return classified;
         }
-        let Some(assignments) = classify_batch(batch, config, round, &known_topics) else {
+        let mut inherited = Vec::new();
+        let mut to_classify = Vec::new();
+        for session in batch {
+            if let Some(topic) = &session.inherited_topic {
+                inherited.push(SemanticAssignment {
+                    session_key: session.stable_key.clone(),
+                    topic_key: topic.topic_key.clone(),
+                    topic_label: topic.topic_label.clone(),
+                    fingerprint: super::semantic_fingerprint(
+                        &session.title,
+                        session.cwd.as_deref(),
+                        &session.backend,
+                    ),
+                    backend_used: topic.backend_used.clone(),
+                    model_used: topic.model_used.clone(),
+                });
+            } else {
+                to_classify.push(session.clone());
+            }
+        }
+        if !inherited.is_empty() {
+            for session in batch {
+                if session.inherited_topic.is_none() {
+                    continue;
+                }
+                if let Some(topic) = &session.inherited_topic {
+                    for duplicate in &session.duplicates {
+                        inherited.push(SemanticAssignment {
+                            session_key: duplicate.stable_key.clone(),
+                            topic_key: topic.topic_key.clone(),
+                            topic_label: topic.topic_label.clone(),
+                            fingerprint: duplicate.fingerprint.clone(),
+                            backend_used: topic.backend_used.clone(),
+                            model_used: topic.model_used.clone(),
+                        });
+                    }
+                }
+            }
+        }
+        if !inherited.is_empty() {
+            let inherited_count = inherited.len();
+            match super::service::request_apply_semantic(sender, inherited, now_ms()) {
+                Ok(_) => classified += inherited_count,
+                Err(error) => tracing::warn!(
+                    category = "semantic_inherit",
+                    "Could not store inherited title-group assignments: {error:?}"
+                ),
+            }
+        }
+        if to_classify.is_empty() {
+            continue;
+        }
+        let Some(assignments) = classify_batch(&to_classify, config, round, &known_topics) else {
             failed_batches += 1;
             continue;
         };
+        let mut assignments = assignments;
+        let mut expanded = Vec::new();
+        for assignment in &assignments {
+            if let Some(session) = to_classify
+                .iter()
+                .find(|session| session.stable_key == assignment.session_key)
+            {
+                for duplicate in &session.duplicates {
+                    expanded.push(SemanticAssignment {
+                        session_key: duplicate.stable_key.clone(),
+                        topic_key: assignment.topic_key.clone(),
+                        topic_label: assignment.topic_label.clone(),
+                        fingerprint: duplicate.fingerprint.clone(),
+                        backend_used: assignment.backend_used.clone(),
+                        model_used: assignment.model_used.clone(),
+                    });
+                }
+            }
+        }
+        assignments.extend(expanded);
         let count = assignments.len();
         let batch_topics = assignments
             .iter()
-            .map(|assignment| assignment.topic_label.clone())
+            .map(|a| a.topic_label.clone())
             .collect::<Vec<_>>();
         match super::service::request_apply_semantic(sender, assignments, now_ms()) {
             Ok(_) => {
@@ -635,6 +707,8 @@ mod tests {
             cwd: cwd.map(str::to_string),
             backend: backend.to_string(),
             stored_fingerprint: None,
+            duplicates: Vec::new(),
+            inherited_topic: None,
         }
     }
 

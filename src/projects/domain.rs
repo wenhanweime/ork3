@@ -559,6 +559,25 @@ pub(crate) struct PendingSemanticSession {
     pub cwd: Option<String>,
     pub backend: String,
     pub stored_fingerprint: Option<String>,
+    /// Other pending sessions with the same normalized title. Only this representative is sent
+    /// to the classifier; a successful result is expanded to every member atomically.
+    pub duplicates: Vec<PendingSemanticDuplicate>,
+    /// A current assignment from another session with this title, when one already exists.
+    pub inherited_topic: Option<InheritedSemanticTopic>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PendingSemanticDuplicate {
+    pub stable_key: String,
+    pub fingerprint: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InheritedSemanticTopic {
+    pub topic_key: String,
+    pub topic_label: String,
+    pub backend_used: String,
+    pub model_used: Option<String>,
 }
 
 /// One classified session, ready to be written to the Catalog.

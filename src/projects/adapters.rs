@@ -629,6 +629,10 @@ fn is_jsonl(path: &Path) -> bool {
     path.extension().and_then(|extension| extension.to_str()) == Some("jsonl")
 }
 
+fn is_default_opencode_title(title: &str) -> bool {
+    title.trim_start().starts_with("New session - ")
+}
+
 fn is_excluded_history_path(path: &Path) -> bool {
     path.components().any(|component| {
         component
@@ -652,7 +656,7 @@ fn parse_codex(path: &Path, _root: &Path) -> Result<Option<SessionCandidate>, ()
     let mut cwd = None;
     let mut session_class = SessionClass::Interactive;
     let mut picker = TitlePicker::default();
-    let mut weight = SessionWeight::default();
+    let mut weight = SessionWeight::known();
     visit_json_lines(path, |value| {
         match value.get("type").and_then(Value::as_str) {
             Some("session_meta") => {
@@ -706,8 +710,9 @@ fn parse_codex(path: &Path, _root: &Path) -> Result<Option<SessionCandidate>, ()
 fn parse_claude(path: &Path, _root: &Path) -> Result<Option<SessionCandidate>, ()> {
     let mut identity = None;
     let mut cwd = None;
-    let mut title = None;
     let mut sidechain = false;
+    let mut picker = TitlePicker::default();
+    let mut weight = SessionWeight::known();
     visit_json_lines(path, |value| {
         if value.get("type").and_then(Value::as_str) == Some("user") {
             sidechain |= value
@@ -723,11 +728,9 @@ fn parse_claude(path: &Path, _root: &Path) -> Result<Option<SessionCandidate>, (
             if cwd.is_none() {
                 cwd = value.get("cwd").and_then(Value::as_str).map(PathBuf::from);
             }
-            if title.is_none() {
-                title = value
-                    .pointer("/message/content")
-                    .and_then(first_text)
-                    .and_then(safe_title);
+            if let Some(message) = value.pointer("/message/content").and_then(first_text) {
+                weight.record(message);
+                picker.offer(message);
             }
         }
         None
@@ -736,13 +739,16 @@ fn parse_claude(path: &Path, _root: &Path) -> Result<Option<SessionCandidate>, (
         return Ok(None);
     }
     let identity = SessionIdentity::id("claude", &identity.ok_or(())?).map_err(|_| ())?;
-    candidate_from_identity(identity, cwd, title, path).map(Some)
+    let mut candidate = candidate_from_identity(identity, cwd, picker.take(), path)?;
+    candidate.weight = weight;
+    Ok(Some(candidate))
 }
 
 fn parse_pi(path: &Path, root: &Path) -> Result<Option<SessionCandidate>, ()> {
     let mut official_id = None;
     let mut cwd = None;
-    let mut title = None;
+    let mut picker = TitlePicker::default();
+    let mut weight = SessionWeight::known();
     let mut saw_session_record = false;
     visit_json_lines(path, |value| {
         match value.get("type").and_then(Value::as_str) {
@@ -754,21 +760,22 @@ fn parse_pi(path: &Path, root: &Path) -> Result<Option<SessionCandidate>, ()> {
             Some("message")
                 if value.pointer("/message/role").and_then(Value::as_str) == Some("user") =>
             {
-                title = value
-                    .pointer("/message/content")
-                    .and_then(first_text)
-                    .and_then(safe_title);
+                if let Some(message) = value.pointer("/message/content").and_then(first_text) {
+                    weight.record(message);
+                    picker.offer(message);
+                }
             }
             _ => {}
         }
-        (saw_session_record && title.is_some()).then_some(())
+        None
     })?;
     if !saw_session_record {
         return Err(());
     }
     let identity =
         SessionIdentity::path("pi", path, root, &[root.to_path_buf()], false).map_err(|_| ())?;
-    let mut candidate = candidate_from_identity(identity, cwd, title, path)?;
+    let mut candidate = candidate_from_identity(identity, cwd, picker.take(), path)?;
+    candidate.weight = weight;
     if let Some(official_id) = official_id {
         candidate.aliases.push(SessionAliasCandidate {
             identity: SessionIdentity::id("pi", &official_id).map_err(|_| ())?,
@@ -852,6 +859,19 @@ fn scan_grok(root: &Path) -> Result<ScanPayload, ScanFailure> {
                 .and_then(Value::as_str)
                 .and_then(safe_title);
             let mut candidate = candidate_from_identity(identity, cwd, title, &entry.path)?;
+            let history_path = session_dir.join("chat_history.jsonl");
+            if history_path.exists() || std::fs::symlink_metadata(&history_path).is_ok() {
+                let mut weight = SessionWeight::known();
+                visit_json_lines(&history_path, |value| {
+                    if value.get("type").and_then(Value::as_str) == Some("user") {
+                        if let Some(message) = value.get("content").and_then(first_text) {
+                            weight.record(message);
+                        }
+                    }
+                    None
+                })?;
+                candidate.weight = weight;
+            }
             candidate.aliases = aliases;
             normalize_candidate_source(&mut candidate, "grok", root, &source_key);
             Ok::<_, ()>(candidate)
@@ -887,15 +907,12 @@ fn scan_opencode(root: &Path) -> Result<ScanPayload, ScanFailure> {
     .map_err(|_| ScanFailure::Failed)?;
     let mut statement = connection
         .prepare(
-            "SELECT s.id, s.directory, s.title, s.time_created, s.time_updated,
-                    EXISTS (
-                        SELECT 1
-                        FROM message m
-                        JOIN part p ON p.message_id = m.id
-                        WHERE m.session_id = s.id
-                          AND json_extract(m.data, '$.role') = 'user'
-                          AND json_extract(p.data, '$.type') = 'text'
-                          AND (
+            "WITH user_content AS (
+                 SELECT m.session_id,
+                        COUNT(DISTINCT m.id) AS user_turns,
+                        COALESCE(SUM(length(COALESCE(json_extract(p.data, '$.text'), ''))), 0)
+                            AS user_chars,
+                        MAX(CASE WHEN
                               instr(json_extract(p.data, '$.text'),
                                     '把下面的编码会话按主题聚类') > 0
                               OR instr(json_extract(p.data, '$.text'),
@@ -910,9 +927,19 @@ fn scan_opencode(root: &Path) -> Result<ScanPayload, ScanFailure> {
                                        '你是工程任务命名编辑') > 0
                               OR instr(json_extract(p.data, '$.text'),
                                        '4-12个字的清晰任务主题名') > 0
-                          )
-                    ) AS classifier_artifact
-             FROM session s WHERE s.parent_id IS NULL AND s.time_archived IS NULL
+                            THEN 1 ELSE 0 END) AS classifier_artifact
+                   FROM message m
+                   JOIN part p ON p.message_id = m.id
+                  WHERE json_extract(m.data, '$.role') = 'user'
+                    AND json_extract(p.data, '$.type') = 'text'
+                  GROUP BY m.session_id
+             )
+             SELECT s.id, s.directory, s.title, s.time_created, s.time_updated,
+                    COALESCE(u.classifier_artifact, 0),
+                    COALESCE(u.user_turns, 0), COALESCE(u.user_chars, 0)
+             FROM session s
+             LEFT JOIN user_content u ON u.session_id = s.id
+             WHERE s.parent_id IS NULL AND s.time_archived IS NULL
              ORDER BY s.time_updated DESC, s.id ASC",
         )
         .map_err(|_| ScanFailure::UnsupportedFormat)?;
@@ -925,6 +952,8 @@ fn scan_opencode(root: &Path) -> Result<ScanPayload, ScanFailure> {
                 row.get::<_, Option<i64>>(3)?,
                 row.get::<_, Option<i64>>(4)?,
                 row.get::<_, bool>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, i64>(7)?,
             ))
         })
         .map_err(|_| ScanFailure::Failed)?;
@@ -933,7 +962,16 @@ fn scan_opencode(root: &Path) -> Result<ScanPayload, ScanFailure> {
     let mut excluded = HashSet::new();
     let mut malformed = 0usize;
     for row in rows {
-        let (id, cwd, title, first_activity_at, last_activity_at, classifier_artifact) = match row {
+        let (
+            id,
+            cwd,
+            title,
+            first_activity_at,
+            last_activity_at,
+            classifier_artifact,
+            user_turns,
+            user_chars,
+        ) = match row {
             Ok(row) => row,
             Err(_) => {
                 malformed = malformed.saturating_add(1);
@@ -962,6 +1000,7 @@ fn scan_opencode(root: &Path) -> Result<ScanPayload, ScanFailure> {
             identity,
             title: title
                 .as_deref()
+                .filter(|value| !is_default_opencode_title(value))
                 .and_then(safe_title)
                 .map(|value| primary_field(value, observed_at, &source_key)),
             cwd: cwd
@@ -977,7 +1016,11 @@ fn scan_opencode(root: &Path) -> Result<ScanPayload, ScanFailure> {
             observed_at,
             aliases: Vec::new(),
             runtime: None,
-            weight: SessionWeight::default(),
+            weight: SessionWeight {
+                turns: usize::try_from(user_turns).unwrap_or(0),
+                chars: usize::try_from(user_chars).unwrap_or(0),
+                known: true,
+            },
             session_class: Some(SessionClass::Interactive),
         });
     }
@@ -1205,9 +1248,18 @@ const TITLE_MAX_CHARS: usize = 96;
 pub(crate) struct SessionWeight {
     pub turns: usize,
     pub chars: usize,
+    pub known: bool,
 }
 
 impl SessionWeight {
+    fn known() -> Self {
+        Self {
+            turns: 0,
+            chars: 0,
+            known: true,
+        }
+    }
+
     fn record(&mut self, message: &str) {
         // Measure only what the user actually wrote. Counting harness preamble made a session of
         // four "hi" turns look like 264 characters of substance and slip past the filter.
@@ -1891,6 +1943,93 @@ mod tests {
         assert!(scan.candidates.is_empty());
         assert!(scan.seen_source_keys.is_empty());
         assert_eq!(scan.excluded_source_keys.len(), 1);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn non_codex_adapters_report_known_user_weight() {
+        let claude_root = temp_dir("claude-weight");
+        write_json_lines(
+            &claude_root.join("claude.jsonl"),
+            &[
+                serde_json::json!({"type":"user","sessionId":"c","cwd":"/tmp","message":{"content":[{"type":"text","text":"第一条真实请求"}]}}),
+                serde_json::json!({"type":"user","sessionId":"c","cwd":"/tmp","message":{"content":[{"type":"text","text":"第二条真实请求"}]}}),
+            ],
+        );
+        let claude = scan_default_root("claude", &claude_root);
+        assert_eq!(claude.candidates[0].weight.turns, 2);
+        assert!(claude.candidates[0].weight.chars > 0);
+        assert!(claude.candidates[0].weight.known);
+
+        let pi_root = temp_dir("pi-weight");
+        write_json_lines(
+            &pi_root.join("pi.jsonl"),
+            &[
+                serde_json::json!({"type":"session","id":"p","cwd":"/tmp"}),
+                serde_json::json!({"type":"message","message":{"role":"user","content":"第一条真实请求"}}),
+                serde_json::json!({"type":"message","message":{"role":"user","content":"第二条真实请求"}}),
+            ],
+        );
+        let pi = scan_default_root("pi", &pi_root);
+        assert_eq!(pi.candidates[0].weight.turns, 2);
+        assert!(pi.candidates[0].weight.known);
+
+        let grok_root = temp_dir("grok-weight");
+        write_fixture("grok", &grok_root, "g", Some("Grok task"), Some("/tmp"));
+        let grok_session = grok_root.join("g");
+        write_json_lines(
+            &grok_session.join("chat_history.jsonl"),
+            &[
+                serde_json::json!({"type":"user","content":[{"type":"text","text":"第一条真实请求"}]}),
+                serde_json::json!({"type":"user","content":[{"type":"text","text":"第二条真实请求"}]}),
+            ],
+        );
+        let grok = scan_default_root("grok", &grok_root);
+        assert_eq!(grok.candidates[0].weight.turns, 2);
+        assert!(grok.candidates[0].weight.known);
+
+        let _ = std::fs::remove_dir_all(claude_root);
+        let _ = std::fs::remove_dir_all(pi_root);
+        let _ = std::fs::remove_dir_all(grok_root);
+    }
+
+    #[test]
+    fn opencode_aggregates_user_weight_and_discards_default_title() {
+        let root = temp_dir("opencode-weight");
+        write_fixture(
+            "opencode",
+            &root,
+            "weighted",
+            Some("New session - 2026-08-17T00:00:00Z"),
+            Some("/tmp"),
+        );
+        let connection = opencode_connection(&root);
+        for (index, text) in ["第一条真实请求", "第二条真实请求"].into_iter().enumerate()
+        {
+            let message_id = format!("message-{index}");
+            connection
+                .execute(
+                    "INSERT INTO message(id, session_id, data) VALUES (?1, 'weighted', ?2)",
+                    params![message_id, serde_json::json!({"role":"user"}).to_string()],
+                )
+                .expect("message");
+            connection
+                .execute(
+                    "INSERT INTO part(id, message_id, session_id, data) VALUES (?1, ?2, 'weighted', ?3)",
+                    params![format!("part-{index}"), message_id, serde_json::json!({"type":"text","text":text}).to_string()],
+                )
+                .expect("part");
+        }
+        drop(connection);
+        let scan = scan_default_root("opencode", &root);
+        let candidate = &scan.candidates[0];
+        assert_eq!(candidate.weight.turns, 2);
+        assert!(candidate.weight.chars > 0);
+        assert!(candidate.weight.known);
+        assert!(
+            candidate.title.is_none(),
+            "default title should use fallback"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 

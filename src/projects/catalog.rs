@@ -7,12 +7,13 @@ use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBe
 use super::classifier;
 use super::domain::{
     normalize_session_title, AdapterScanStatus, AutomationTemplateSummary, CandidateField,
-    IndexedSessionSummary, PendingSemanticSession, ProjectClassification, ProjectKind,
-    ProjectSummary, ProjectsSnapshot, SemanticAssignment, SessionCandidate, SessionClass,
-    SessionCursor, SessionIdentity, SessionRefKind, PROJECTS_SCHEMA_VERSION,
+    IndexedSessionSummary, InheritedSemanticTopic, PendingSemanticDuplicate,
+    PendingSemanticSession, ProjectClassification, ProjectKind, ProjectSummary, ProjectsSnapshot,
+    SemanticAssignment, SessionCandidate, SessionClass, SessionCursor, SessionIdentity,
+    SessionRefKind, PROJECTS_SCHEMA_VERSION,
 };
 
-const CATALOG_SCHEMA_VERSION: u32 = 3;
+const CATALOG_SCHEMA_VERSION: u32 = 4;
 
 /// Keyset page over one project's sessions.
 ///
@@ -207,6 +208,10 @@ impl ProjectCatalog {
         }
         if version == 2 {
             self.migrate_v2_to_v3()?;
+            version = 3;
+        }
+        if version == 3 {
+            self.migrate_v3_to_v4()?;
             return Ok(());
         }
         if version == CATALOG_SCHEMA_VERSION {
@@ -257,6 +262,8 @@ impl ProjectCatalog {
                 -- How much the user actually said, used to skip thin sessions when classifying.
                 user_turns INTEGER NOT NULL DEFAULT 0,
                 user_chars INTEGER NOT NULL DEFAULT 0,
+                user_weight_known INTEGER NOT NULL DEFAULT 0
+                    CHECK (user_weight_known IN (0, 1)),
                 session_class TEXT NOT NULL DEFAULT 'interactive'
                     CHECK (session_class IN ('interactive', 'automation', 'ephemeral')),
                 created_at INTEGER NOT NULL,
@@ -356,7 +363,7 @@ impl ProjectCatalog {
             CREATE INDEX semantic_fingerprint
                 ON semantic_assignments(fingerprint);
 
-            PRAGMA user_version = 3;
+            PRAGMA user_version = 4;
             "#,
         )?;
         transaction.commit()?;
@@ -449,6 +456,36 @@ impl ProjectCatalog {
             )?;
         }
         transaction.pragma_update(None, "user_version", 3)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Distinguishes a successfully measured empty session from a legacy row whose adapter did
+    /// not expose weight yet. Codex was the only measured backend before v4.
+    fn migrate_v3_to_v4(&mut self) -> Result<(), CatalogError> {
+        let has_weight_known = table_has_column(&self.connection, "sessions", "user_weight_known")?;
+        let has_legacy_weight_columns = table_has_column(&self.connection, "sessions", "backend")?
+            && table_has_column(&self.connection, "sessions", "user_turns")?
+            && table_has_column(&self.connection, "sessions", "user_chars")?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if !has_weight_known {
+            transaction.execute_batch(
+                "ALTER TABLE sessions
+                 ADD COLUMN user_weight_known INTEGER NOT NULL DEFAULT 0
+                 CHECK (user_weight_known IN (0, 1));",
+            )?;
+            if has_legacy_weight_columns {
+                transaction.execute(
+                    "UPDATE sessions
+                        SET user_weight_known = 1
+                      WHERE backend = 'codex' OR user_turns > 0 OR user_chars > 0",
+                    [],
+                )?;
+            }
+        }
+        transaction.pragma_update(None, "user_version", 4)?;
         transaction.commit()?;
         Ok(())
     }
@@ -771,7 +808,8 @@ impl ProjectCatalog {
         limit: usize,
     ) -> Result<Vec<PendingSemanticSession>, CatalogError> {
         let mut statement = self.connection.prepare(
-            "SELECT s.stable_key, s.title, s.cwd, s.backend, sa.fingerprint
+            "SELECT s.stable_key, s.title, s.cwd, s.backend, sa.fingerprint,
+                    sa.topic_key, sa.topic_label, sa.backend_used, sa.model_used
              FROM sessions s
              JOIN assignments a ON a.session_key = s.stable_key
              LEFT JOIN semantic_assignments sa ON sa.session_key = s.stable_key
@@ -781,8 +819,13 @@ impl ProjectCatalog {
                -- \"no clear topic\". Either signal alone is enough to be worth classifying:
                -- a long back-and-forth, or one detailed request. Mirrors
                -- `SessionWeight::is_substantive`.
-               AND s.user_chars >= ?3
-               AND (s.user_turns >= ?1 OR s.user_chars >= ?2)
+               AND (
+                   (s.user_weight_known = 1
+                    AND s.user_chars >= ?3
+                    AND (s.user_turns >= ?1 OR s.user_chars >= ?2))
+                   OR (s.user_weight_known = 0
+                       AND s.title NOT LIKE 'New session - %')
+               )
              ORDER BY s.last_activity_at DESC, s.stable_key ASC",
         )?;
         let rows = statement
@@ -793,25 +836,92 @@ impl ProjectCatalog {
                     super::adapters::MIN_ANY_CHARS as i64
                 ],
                 |row| {
-                    Ok(PendingSemanticSession {
-                        stable_key: row.get(0)?,
-                        title: row.get(1)?,
-                        cwd: row.get(2)?,
-                        backend: row.get(3)?,
-                        stored_fingerprint: row.get(4)?,
-                    })
+                    Ok((
+                        PendingSemanticSession {
+                            stable_key: row.get(0)?,
+                            title: row.get(1)?,
+                            cwd: row.get(2)?,
+                            backend: row.get(3)?,
+                            stored_fingerprint: row.get(4)?,
+                            duplicates: Vec::new(),
+                            inherited_topic: None,
+                        },
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, Option<String>>(7)?,
+                        row.get::<_, Option<String>>(8)?,
+                    ))
                 },
             )?
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(rows
-            .into_iter()
-            .filter(|row| {
-                let current =
-                    super::semantic_fingerprint(&row.title, row.cwd.as_deref(), &row.backend);
-                row.stored_fingerprint.as_deref() != Some(current.as_str())
-            })
-            .take(limit)
-            .collect())
+
+        let mut groups = HashMap::<String, Vec<_>>::new();
+        let mut group_order = Vec::new();
+        for row in rows {
+            let normalized = normalize_session_title(&row.0.title);
+            if !groups.contains_key(&normalized) {
+                group_order.push(normalized.clone());
+            }
+            groups.entry(normalized).or_default().push(row);
+        }
+
+        let mut pending = Vec::new();
+        let mut consumed = 0usize;
+        for normalized in group_order {
+            if consumed >= limit {
+                break;
+            }
+            let Some(group) = groups.remove(&normalized) else {
+                continue;
+            };
+            let seed =
+                group
+                    .iter()
+                    .find_map(|(session, topic_key, topic_label, backend, model)| {
+                        let fingerprint = super::semantic_fingerprint(
+                            &session.title,
+                            session.cwd.as_deref(),
+                            &session.backend,
+                        );
+                        if session.stored_fingerprint.as_deref() != Some(fingerprint.as_str()) {
+                            return None;
+                        }
+                        Some(InheritedSemanticTopic {
+                            topic_key: topic_key.clone()?,
+                            topic_label: topic_label.clone()?,
+                            backend_used: backend.clone()?,
+                            model_used: model.clone(),
+                        })
+                    });
+            let mut stale = group
+                .into_iter()
+                .filter_map(|(session, _, _, _, _)| {
+                    let fingerprint = super::semantic_fingerprint(
+                        &session.title,
+                        session.cwd.as_deref(),
+                        &session.backend,
+                    );
+                    (session.stored_fingerprint.as_deref() != Some(fingerprint.as_str()))
+                        .then_some((session, fingerprint))
+                })
+                .take(limit.saturating_sub(consumed))
+                .collect::<Vec<_>>();
+            if stale.is_empty() {
+                continue;
+            }
+            let (mut representative, _) = stale.remove(0);
+            representative.inherited_topic = seed;
+            representative.duplicates = stale
+                .into_iter()
+                .map(|(session, fingerprint)| PendingSemanticDuplicate {
+                    stable_key: session.stable_key,
+                    fingerprint,
+                })
+                .collect();
+            consumed += 1 + representative.duplicates.len();
+            pending.push(representative);
+        }
+        Ok(pending)
     }
 
     /// Topic labels already in use, most recently assigned first.
@@ -1344,7 +1454,7 @@ fn table_exists(connection: &Connection, table: &str) -> Result<bool, CatalogErr
     )?)
 }
 
-/// Creates a transactionally consistent copy before the first session-class migration.
+/// Creates a transactionally consistent copy before session metadata migrations.
 ///
 /// `VACUUM INTO` reads through SQLite itself, so committed WAL pages are included. A raw file copy
 /// could silently omit them and produce a backup older than the Catalog being migrated.
@@ -1354,9 +1464,9 @@ fn backup_before_session_class_migration(
 ) -> Result<(), CatalogError> {
     let version: u32 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
     if version == 0
-        || version >= 3
+        || version >= 4
         || !table_exists(connection, "sessions")?
-        || table_has_column(connection, "sessions", "session_class")?
+        || table_has_column(connection, "sessions", "user_weight_known")?
     {
         return Ok(());
     }
@@ -1534,9 +1644,9 @@ fn upsert_session(
         "INSERT INTO sessions(
            stable_key, backend, ref_kind, ref_value, title, title_observed_at,
            title_priority, title_source_key, first_activity_at, last_activity_at,
-           user_turns, user_chars, session_class, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?12, ?13,
-                 COALESCE(?14, 'interactive'), ?11, ?11)
+           user_turns, user_chars, user_weight_known, session_class, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?12, ?13, ?14,
+                 COALESCE(?15, 'interactive'), ?11, ?11)
          ON CONFLICT(stable_key) DO UPDATE SET
            first_activity_at = MIN(first_activity_at, excluded.first_activity_at),
            last_activity_at = MAX(last_activity_at, excluded.last_activity_at),
@@ -1544,9 +1654,10 @@ fn upsert_session(
            -- overwrite what the file scan measured.
            user_turns = MAX(user_turns, excluded.user_turns),
            user_chars = MAX(user_chars, excluded.user_chars),
+           user_weight_known = MAX(user_weight_known, excluded.user_weight_known),
            session_class = CASE
-               WHEN ?14 IS NULL THEN session_class
-               ELSE ?14
+               WHEN ?15 IS NULL THEN session_class
+               ELSE ?15
            END,
            updated_at = MAX(updated_at, excluded.updated_at)",
         params![
@@ -1563,6 +1674,7 @@ fn upsert_session(
             candidate.observed_at,
             candidate.weight.turns as i64,
             candidate.weight.chars as i64,
+            i64::from(candidate.weight.known),
             candidate.session_class.map(SessionClass::as_str)
         ],
     )?;
@@ -1987,6 +2099,7 @@ mod tests {
         first.weight = super::super::adapters::SessionWeight {
             turns: 4,
             chars: 100,
+            known: true,
         };
         second.weight = first.weight;
 
@@ -2016,6 +2129,81 @@ mod tests {
     }
 
     #[test]
+    fn semantic_pending_groups_titles_and_inherits_existing_topic() {
+        let mut catalog = ProjectCatalog::open_in_memory().expect("catalog");
+        let mut seed = candidate("claude", "semantic-seed", 10);
+        let mut sibling = candidate("opencode", "semantic-sibling", 20);
+        let mut untouched = candidate("pi", "semantic-untouched", 30);
+        for item in [&mut seed, &mut sibling, &mut untouched] {
+            item.title.as_mut().expect("title").value = "同一个任务标题".to_string();
+            item.weight = super::super::adapters::SessionWeight {
+                turns: 4,
+                chars: 120,
+                known: true,
+            };
+        }
+        catalog
+            .upsert_scanned_candidates(&[seed.clone(), sibling.clone(), untouched.clone()])
+            .expect("sessions");
+        let topic = "同一个任务";
+        catalog
+            .apply_semantic_batch(
+                &[SemanticAssignment {
+                    session_key: seed.identity.stable_key.clone(),
+                    topic_key: super::super::semantic_topic_key(topic),
+                    topic_label: topic.to_string(),
+                    fingerprint: super::super::semantic_fingerprint(
+                        "同一个任务标题",
+                        None,
+                        "claude",
+                    ),
+                    backend_used: "test".to_string(),
+                    model_used: None,
+                }],
+                40,
+            )
+            .expect("seed topic");
+
+        let pending = catalog.pending_semantic_sessions(10).expect("pending");
+        assert_eq!(
+            pending.len(),
+            1,
+            "same-title sessions use one representative"
+        );
+        assert_eq!(pending[0].duplicates.len(), 1);
+        assert_eq!(
+            pending[0].inherited_topic.as_ref().unwrap().topic_label,
+            topic
+        );
+        assert_eq!(
+            pending[0].duplicates[0].stable_key,
+            sibling.identity.stable_key
+        );
+        assert_eq!(pending[0].stable_key, untouched.identity.stable_key);
+    }
+
+    #[test]
+    fn unknown_weight_with_title_is_pending_but_known_empty_default_is_not() {
+        let mut catalog = ProjectCatalog::open_in_memory().expect("catalog");
+        let mut unknown = candidate("grok", "unknown-weight", 10);
+        unknown.title.as_mut().expect("title").value = "可用的真实任务标题".to_string();
+        let mut empty = candidate("opencode", "known-empty", 20);
+        empty.title.as_mut().expect("title").value =
+            "New session - 2026-08-17T00:00:00Z".to_string();
+        empty.weight = super::super::adapters::SessionWeight {
+            turns: 0,
+            chars: 0,
+            known: true,
+        };
+        catalog
+            .upsert_scanned_candidates(&[unknown.clone(), empty])
+            .expect("sessions");
+        let pending = catalog.pending_semantic_sessions(10).expect("pending");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].stable_key, unknown.identity.stable_key);
+    }
+
+    #[test]
     fn explicit_automation_is_hidden_without_waiting_for_title_threshold() {
         let mut catalog = ProjectCatalog::open_in_memory().expect("catalog");
         let mut item = candidate("codex", "exec", 10);
@@ -2023,6 +2211,7 @@ mod tests {
         item.weight = super::super::adapters::SessionWeight {
             turns: 10,
             chars: 500,
+            known: true,
         };
         catalog
             .upsert_scanned_candidates(&[item])
@@ -2060,6 +2249,7 @@ mod tests {
             .execute_batch(
                 "DROP INDEX sessions_class;
                  ALTER TABLE sessions DROP COLUMN session_class;
+                 ALTER TABLE sessions DROP COLUMN user_weight_known;
                  PRAGMA user_version = 2;
                  PRAGMA journal_mode = WAL;
                  PRAGMA wal_autocheckpoint = 0;",
@@ -2547,6 +2737,7 @@ mod tests {
         dirty.weight = crate::projects::adapters::SessionWeight {
             turns: 4,
             chars: 120,
+            known: true,
         };
         let session_key = dirty.identity.stable_key.clone();
         catalog.upsert_candidate(&dirty).expect("dirty upsert");
