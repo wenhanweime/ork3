@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-use super::domain::{PendingSemanticSession, SemanticAssignment};
+use super::domain::{PendingSemanticSession, SemanticAssignment, SemanticTopicMerge};
 
 /// How long a single backend invocation may run before the batch is failed over.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
@@ -31,6 +31,16 @@ const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const MAX_KNOWN_TOPICS: usize = 60;
 /// Prevent one malformed backend label from making every later prompt unbounded.
 const MAX_TOPIC_LABEL_CHARS: usize = 80;
+const DISALLOWED_TOPIC_LABELS: [&str; 8] = [
+    "未分类",
+    "未分类会话",
+    "其他",
+    "杂项",
+    "misc",
+    "uncategorized",
+    "other",
+    "no clear topic",
+];
 static SCRATCH_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Per-invocation state root for backends that do not provide a no-persist flag.
@@ -196,7 +206,8 @@ pub(crate) fn build_prompt(batch: &[PendingSemanticSession], known_topics: &[Str
     let mut prompt = String::from(
         "把下面的编码会话按主题聚类。主题相同的归为一组，即使目录或工具不同。\n\
          只输出 JSON，格式 {\"clusters\":[{\"topic\":\"简短主题名\",\"ids\":[1,2]}]}，不要解释。\n\
-         主题名用会话本身的语言，简短具体。不要为每个会话都单独建一组。\n\n",
+         主题名用会话本身的语言，简短具体。不要为每个会话都单独建一组。\n\
+         禁止使用“未分类”“其他”“杂项”或 no clear topic 这类垃圾桶主题。\n\n",
     );
 
     // Each batch is clustered independently, so without this the same effort becomes
@@ -259,6 +270,11 @@ pub(crate) fn parse_response(
         if topic.chars().count() > MAX_TOPIC_LABEL_CHARS {
             return Err(BatchError::Failed("cluster topic is too long".to_string()));
         }
+        if is_disallowed_topic(topic) {
+            return Err(BatchError::Failed(
+                "cluster topic is a disallowed catch-all label".to_string(),
+            ));
+        }
         let ids = cluster
             .get("ids")
             .and_then(Value::as_array)
@@ -294,6 +310,136 @@ pub(crate) fn parse_response(
         return Err(BatchError::Failed("no sessions were assigned".to_string()));
     }
     Ok(assignments)
+}
+
+fn is_disallowed_topic(topic: &str) -> bool {
+    let normalized = topic
+        .trim()
+        .trim_matches(|character: char| character.is_ascii_punctuation())
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase();
+    DISALLOWED_TOPIC_LABELS.contains(&normalized.as_str())
+}
+
+fn build_merge_prompt(labels: &[String]) -> String {
+    let mut prompt = String::from("合并下面的主题标签中明显相同或近义的主题。只输出 JSON，格式 ");
+    prompt.push_str("{\"merges\":[{\"into\":\"保留标签\",\"from\":[\"被合并标签\"]}]}。\n");
+    prompt
+        .push_str("只能使用列表中的原标签，不要创建新标签；没有需要合并时输出 {\"merges\":[]}。\n");
+    for label in labels {
+        let quoted = serde_json::to_string(label).unwrap_or_else(|_| "\"\"".to_string());
+        prompt.push_str(&format!("- {quoted}\n"));
+    }
+    prompt
+}
+
+fn parse_merge_response(
+    response: &str,
+    labels: &[String],
+) -> Result<Vec<SemanticTopicMerge>, BatchError> {
+    let json = extract_json(response)
+        .ok_or_else(|| BatchError::Failed("no JSON object in merge response".to_string()))?;
+    let parsed: Value = serde_json::from_str(&json)
+        .map_err(|err| BatchError::Failed(format!("invalid merge JSON: {err}")))?;
+    let merges = parsed
+        .get("merges")
+        .and_then(Value::as_array)
+        .ok_or_else(|| BatchError::Failed("missing merges array".to_string()))?;
+    let known = labels
+        .iter()
+        .cloned()
+        .collect::<std::collections::HashSet<_>>();
+    let mut seen_from = std::collections::HashSet::new();
+    let mut result = Vec::new();
+    for merge in merges {
+        let into = merge
+            .get("into")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| BatchError::Failed("merge missing into".to_string()))?;
+        if !known.contains(&into) {
+            return Err(BatchError::Failed(
+                "merge references unknown into label".to_string(),
+            ));
+        }
+        let from = merge
+            .get("from")
+            .and_then(Value::as_array)
+            .ok_or_else(|| BatchError::Failed("merge missing from array".to_string()))?
+            .iter()
+            .map(|value| {
+                value.as_str().map(str::to_string).ok_or_else(|| {
+                    BatchError::Failed("merge from label is not a string".to_string())
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if from.is_empty()
+            || from.iter().any(|label| {
+                !known.contains(label) || label == &into || !seen_from.insert(label.clone())
+            })
+        {
+            return Err(BatchError::Failed(
+                "merge contains unknown or conflicting labels".to_string(),
+            ));
+        }
+        result.push(SemanticTopicMerge { into, from });
+    }
+    Ok(result)
+}
+
+fn run_topic_merge_maintenance(
+    sender: &std::sync::mpsc::Sender<super::service::ProjectCommand>,
+    config: &SemanticConfig,
+) {
+    let labels = match super::service::request_begin_topic_merge(sender, now_ms()) {
+        Ok(labels) => labels,
+        Err(error) => {
+            tracing::debug!(
+                category = "semantic_merge",
+                "Could not reserve merge pass: {error:?}"
+            );
+            return;
+        }
+    };
+    if labels.len() < 2 {
+        return;
+    }
+    let prompt = build_merge_prompt(&labels);
+    for backend in &config.backends {
+        let models: Vec<Option<&str>> = if backend.models.is_empty() {
+            vec![None]
+        } else {
+            backend
+                .models
+                .iter()
+                .map(|model| Some(model.as_str()))
+                .collect()
+        };
+        for model in models {
+            let Ok(output) = run_backend(&backend.name, model, &prompt, config.timeout) else {
+                continue;
+            };
+            let Ok(merges) = parse_merge_response(&output, &labels) else {
+                continue;
+            };
+            if merges.is_empty() {
+                return;
+            }
+            match super::service::request_apply_topic_merges(sender, merges, now_ms()) {
+                Ok(_) => tracing::info!(
+                    category = "semantic_merge",
+                    "Applied topic merge maintenance"
+                ),
+                Err(error) => tracing::warn!(
+                    category = "semantic_merge",
+                    "Could not apply topic merges: {error:?}"
+                ),
+            }
+            return;
+        }
+    }
 }
 
 /// Finds the outermost JSON object in a reply.
@@ -679,13 +825,14 @@ pub(crate) fn run_classification_worker(
             // rather than spinning; a later pass retries after the idle interval.
             idle_rounds += 1;
             if idle_rounds >= 2 {
-                return;
+                break;
             }
         } else {
             idle_rounds = 0;
         }
         std::thread::sleep(config.idle_backfill);
     }
+    run_topic_merge_maintenance(sender, config);
 }
 
 fn now_ms() -> i64 {
@@ -830,6 +977,13 @@ mod tests {
             None
         )
         .is_err());
+        assert!(parse_response(
+            r#"{"clusters":[{"topic":"未分类会话","ids":[1,2,3]}]}"#,
+            &batch,
+            "pi",
+            None
+        )
+        .is_err());
         // A duplicated id would put one session in two Projects.
         assert!(parse_response(
             r#"{"clusters":[{"topic":"a","ids":[1]},{"topic":"b","ids":[1]}]}"#,
@@ -886,6 +1040,24 @@ mod tests {
         let long_topic = "x".repeat(MAX_TOPIC_LABEL_CHARS + 1);
         let response = format!(r#"{{"clusters":[{{"topic":"{long_topic}","ids":[1]}}]}}"#);
         assert!(parse_response(&response, &batch, "pi", None).is_err());
+    }
+
+    #[test]
+    fn merge_response_rejects_unknown_and_overlapping_labels() {
+        let labels = vec![
+            "主题 A".to_string(),
+            "主题 B".to_string(),
+            "主题 C".to_string(),
+        ];
+        let valid = r#"{"merges":[{"into":"主题 A","from":["主题 B"]}]}"#;
+        assert_eq!(
+            parse_merge_response(valid, &labels).unwrap()[0].from,
+            vec!["主题 B"]
+        );
+        let unknown = r#"{"merges":[{"into":"主题 A","from":["不存在"]}]}"#;
+        assert!(parse_merge_response(unknown, &labels).is_err());
+        let overlap = r#"{"merges":[{"into":"主题 A","from":["主题 B"]},{"into":"主题 C","from":["主题 B"]}]}"#;
+        assert!(parse_merge_response(overlap, &labels).is_err());
     }
 
     #[test]

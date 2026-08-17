@@ -591,6 +591,13 @@ pub(crate) struct SemanticAssignment {
     pub model_used: Option<String>,
 }
 
+/// A validated label-only semantic maintenance operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SemanticTopicMerge {
+    pub into: String,
+    pub from: Vec<String>,
+}
+
 fn versioned_key(domain: &[u8], fields: &[&[u8]]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(domain);

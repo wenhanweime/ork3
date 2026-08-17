@@ -1214,10 +1214,11 @@ fn first_text(value: &Value) -> Option<&str> {
 /// message. Treating that as a title produced 9,714 of 10,291 sessions titled with instruction
 /// text on this machine, which is both useless in the tree and a body-content leak into the
 /// classifier prompt (SPEC §3.2).
-const INJECTED_PREAMBLE_MARKERS: [&str; 6] = [
+const INJECTED_PREAMBLE_MARKERS: [&str; 7] = [
     "<user_instructions>",
     "<environment_context>",
-    "AGENTS.md instructions for",
+    "AGENTS.md instructions",
+    "[Assistant Rules - You MUST follow",
     "# Repository Guidelines",
     "<INSTRUCTIONS>",
     "Codebase and user instructions are shown below",
@@ -1394,6 +1395,11 @@ fn strip_injected_preamble(value: &str) -> &str {
         .iter()
         .any(|marker| unprefixed.starts_with(marker))
     {
+        // AGENTS.md is commonly injected as a heading followed by a bounded INSTRUCTIONS block.
+        // Preserve a real request appended after that block instead of discarding the whole turn.
+        if let Some(index) = rest.find("</INSTRUCTIONS>") {
+            return strip_injected_preamble(&rest[index + "</INSTRUCTIONS>".len()..]);
+        }
         return "";
     }
     rest
@@ -2215,6 +2221,16 @@ mod tests {
             Some("修复登录 bug".to_string())
         );
         assert_eq!(safe_title("修复登录 bug"), Some("修复登录 bug".to_string()));
+        assert_eq!(
+            safe_title(
+                "# AGENTS.md instructions <INSTRUCTIONS>规则</INSTRUCTIONS>\n修复 Projects 聚类"
+            ),
+            Some("修复 Projects 聚类".to_string())
+        );
+        assert_eq!(
+            safe_title("[Assistant Rules - You MUST follow these instructions] internal"),
+            None
+        );
     }
 
     #[test]

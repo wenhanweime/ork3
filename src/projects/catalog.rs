@@ -9,8 +9,8 @@ use super::domain::{
     normalize_session_title, AdapterScanStatus, AutomationTemplateSummary, CandidateField,
     IndexedSessionSummary, InheritedSemanticTopic, PendingSemanticDuplicate,
     PendingSemanticSession, ProjectClassification, ProjectKind, ProjectSummary, ProjectsSnapshot,
-    SemanticAssignment, SessionCandidate, SessionClass, SessionCursor, SessionIdentity,
-    SessionRefKind, PROJECTS_SCHEMA_VERSION,
+    SemanticAssignment, SemanticTopicMerge, SessionCandidate, SessionClass, SessionCursor,
+    SessionIdentity, SessionRefKind, PROJECTS_SCHEMA_VERSION,
 };
 
 const CATALOG_SCHEMA_VERSION: u32 = 4;
@@ -940,6 +940,93 @@ impl ProjectCatalog {
             .query_map(params![limit as i64], |row| row.get::<_, String>(0))?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    /// Reserves the daily topic-merge maintenance window and returns the current labels.
+    /// Reserving before calling a backend prevents repeated failed calls from running more than
+    /// once per day, while the label-only operation remains safe to retry on the next day.
+    pub(crate) fn begin_topic_merge(&mut self, now: i64) -> Result<Vec<String>, CatalogError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let last: Option<i64> = transaction
+            .query_row(
+                "SELECT value FROM catalog_meta WHERE key = 'semantic_merge_at'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if last.is_some_and(|value| now.saturating_sub(value) < 86_400_000) {
+            transaction.commit()?;
+            return Ok(Vec::new());
+        }
+        transaction.execute(
+            "INSERT INTO catalog_meta(key, value) VALUES ('semantic_merge_at', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [now],
+        )?;
+        let mut statement = transaction.prepare(
+            "SELECT topic_label FROM semantic_assignments
+             GROUP BY topic_key, topic_label ORDER BY MAX(classified_at) DESC",
+        )?;
+        let labels = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+        transaction.commit()?;
+        Ok(labels)
+    }
+
+    /// Applies an all-or-nothing label merge. Session directory assignments and locks are never
+    /// touched; only the discardable semantic rows change.
+    pub(crate) fn apply_topic_merges(
+        &mut self,
+        merges: &[SemanticTopicMerge],
+        observed_at: i64,
+    ) -> Result<u64, CatalogError> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let labels = transaction
+            .prepare("SELECT topic_key, topic_label FROM semantic_assignments GROUP BY topic_key, topic_label")?
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        let known = labels.into_iter().collect::<HashMap<_, _>>();
+        let mut seen_from = HashSet::new();
+        for merge in merges {
+            let into_key = super::semantic_topic_key(&merge.into);
+            if merge.from.is_empty() || !known.contains_key(&into_key) {
+                return Err(CatalogError::Sqlite(rusqlite::Error::InvalidQuery));
+            }
+            for from in &merge.from {
+                let from_key = super::semantic_topic_key(from);
+                if from_key == into_key
+                    || !known.contains_key(&from_key)
+                    || !seen_from.insert(from_key)
+                {
+                    return Err(CatalogError::Sqlite(rusqlite::Error::InvalidQuery));
+                }
+            }
+        }
+        for merge in merges {
+            let into_key = super::semantic_topic_key(&merge.into);
+            for from in &merge.from {
+                transaction.execute(
+                    "UPDATE semantic_assignments
+                        SET topic_key = ?1, topic_label = ?2, classified_at = ?3
+                      WHERE topic_key = ?4",
+                    params![
+                        into_key,
+                        merge.into,
+                        observed_at,
+                        super::semantic_topic_key(from)
+                    ],
+                )?;
+            }
+        }
+        let revision = bump_revision(&transaction)?;
+        transaction.commit()?;
+        Ok(revision)
     }
 
     /// Applies one classified batch atomically.
@@ -2201,6 +2288,75 @@ mod tests {
         let pending = catalog.pending_semantic_sessions(10).expect("pending");
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].stable_key, unknown.identity.stable_key);
+    }
+
+    #[test]
+    fn topic_merge_is_atomic_and_only_rewrites_semantic_rows() {
+        let mut catalog = ProjectCatalog::open_in_memory().expect("catalog");
+        let first = candidate("codex", "merge-a", 10);
+        let second = candidate("codex", "merge-b", 20);
+        catalog
+            .upsert_scanned_candidates(&[first.clone(), second.clone()])
+            .expect("sessions");
+        let make_assignment = |session: &SessionCandidate, topic: &str| SemanticAssignment {
+            session_key: session.identity.stable_key.clone(),
+            topic_key: super::super::semantic_topic_key(topic),
+            topic_label: topic.to_string(),
+            fingerprint: super::super::semantic_fingerprint(
+                &session.title.as_ref().unwrap().value,
+                None,
+                "codex",
+            ),
+            backend_used: "test".to_string(),
+            model_used: None,
+        };
+        catalog
+            .apply_semantic_batch(
+                &[
+                    make_assignment(&first, "主题 A"),
+                    make_assignment(&second, "主题 B"),
+                ],
+                30,
+            )
+            .expect("semantic rows");
+        let revision = catalog.revision().expect("revision");
+        catalog
+            .apply_topic_merges(
+                &[SemanticTopicMerge {
+                    into: "主题 A".to_string(),
+                    from: vec!["主题 B".to_string()],
+                }],
+                40,
+            )
+            .expect("merge");
+        let merged: i64 = catalog
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM semantic_assignments WHERE topic_label = '主题 A'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("merged rows");
+        assert_eq!(merged, 2);
+        assert!(catalog.revision().expect("revision") > revision);
+        assert!(catalog
+            .apply_topic_merges(
+                &[SemanticTopicMerge {
+                    into: "主题 A".to_string(),
+                    from: vec!["不存在".to_string()],
+                }],
+                50,
+            )
+            .is_err());
+        let still_merged: i64 = catalog
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM semantic_assignments WHERE topic_label = '主题 A'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("atomic rows");
+        assert_eq!(still_merged, 2);
     }
 
     #[test]

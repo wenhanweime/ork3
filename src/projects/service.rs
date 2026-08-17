@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex, RwLock};
 
 use super::catalog::{CatalogError, ScanCompletion};
-use super::domain::{PendingSemanticSession, SemanticAssignment};
+use super::domain::{PendingSemanticSession, SemanticAssignment, SemanticTopicMerge};
 use super::{
     ProjectCatalog, ProjectSessionsPage, ProjectsSnapshot, SessionCandidate, SessionCursor,
 };
@@ -92,6 +92,15 @@ pub(crate) enum ProjectCommand {
     KnownTopics {
         limit: usize,
         reply: mpsc::Sender<Result<Vec<String>, ProjectServiceError>>,
+    },
+    BeginTopicMerge {
+        now: i64,
+        reply: mpsc::Sender<Result<Vec<String>, ProjectServiceError>>,
+    },
+    ApplyTopicMerges {
+        merges: Vec<SemanticTopicMerge>,
+        observed_at: i64,
+        reply: mpsc::Sender<Result<u64, ProjectServiceError>>,
     },
     /// One classified batch, applied through the same serialized writer as every other mutation.
     ApplySemantic {
@@ -524,6 +533,34 @@ pub(crate) fn request_apply_semantic(
     })
 }
 
+pub(crate) fn request_begin_topic_merge(
+    sender: &mpsc::Sender<ProjectCommand>,
+    now: i64,
+) -> Result<Vec<String>, ProjectServiceError> {
+    let (reply_tx, reply_rx) = mpsc::channel();
+    sender
+        .send(ProjectCommand::BeginTopicMerge {
+            now,
+            reply: reply_tx,
+        })
+        .map_err(|_| ProjectServiceError::unavailable())?;
+    reply_rx
+        .recv()
+        .map_err(|_| ProjectServiceError::unavailable())?
+}
+
+pub(crate) fn request_apply_topic_merges(
+    sender: &mpsc::Sender<ProjectCommand>,
+    merges: Vec<SemanticTopicMerge>,
+    observed_at: i64,
+) -> Result<u64, ProjectServiceError> {
+    request_on_sender(sender, |reply| ProjectCommand::ApplyTopicMerges {
+        merges,
+        observed_at,
+        reply,
+    })
+}
+
 fn process_command(
     catalog: &mut ProjectCatalog,
     snapshot: &RwLock<ProjectsSnapshot>,
@@ -564,6 +601,19 @@ fn process_command(
                 .map_err(ProjectServiceError::catalog);
             let _ = reply.send(result);
         }
+        ProjectCommand::BeginTopicMerge { now, reply } => {
+            let result = catalog
+                .begin_topic_merge(now)
+                .map_err(ProjectServiceError::catalog);
+            let _ = reply.send(result);
+        }
+        ProjectCommand::ApplyTopicMerges {
+            merges,
+            observed_at,
+            reply,
+        } => finish_mutation(catalog, snapshot, event_hub, reply, |catalog| {
+            catalog.apply_topic_merges(&merges, observed_at)
+        }),
         ProjectCommand::PendingSemantic { limit, reply } => {
             let result = catalog
                 .pending_semantic_sessions(limit)
